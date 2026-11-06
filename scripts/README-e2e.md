@@ -2,6 +2,15 @@
 
 对一个**运行中的** MySQL 蜜罐（假 MySQL、真 Wire Protocol）做外部黑盒验证。
 脚本自己不做任何连接，导入即安全；所有动作都在 `if __name__ == "__main__"` 之后。
+`pymysql` / `mysql.connector` 都不在模块顶层导入，所以缺依赖也不影响导入。
+
+## 依赖
+
+```bash
+python -m pip install pymysql mysql-connector-python
+```
+
+`pymysql` 必需；`mysql.connector` 只用于检查 2，缺它可以加 `--skip-connector`。
 
 ## 用法
 
