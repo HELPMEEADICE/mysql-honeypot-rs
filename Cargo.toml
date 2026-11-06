@@ -19,9 +19,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [profile.release]
-# Small and fast enough for a honeypot; `panic = "abort"` is deliberately NOT
-# set so a panic can never take down more than the session that caused it.
-opt-level = "s"
-lto = true
+# Fully optimised for size. `panic = "abort"` means a panic terminates the
+# whole process instead of unwinding a single task; the input paths are written
+# to be panic-free and the test suite exercises hostile packets.
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
-strip = true
+panic = "abort"
+strip = "debuginfo"
+debug = false
+incremental = false
+overflow-checks = false

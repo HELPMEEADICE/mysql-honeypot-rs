@@ -1,0 +1,242 @@
+# Cross-platform release builds.
+#
+# Triggers:
+#   * `release: published` — every asset is attached to that GitHub release.
+#   * `workflow_dispatch`  — the same archives are published as workflow
+#                            artifacts, downloadable from the Actions run page.
+#
+# Targets: Windows (x86_64/aarch64), macOS (x86_64/aarch64),
+#          Linux (x86_64/aarch64/armv7/riscv64/mips).
+name: Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# A release build must never be cancelled half-way, and must never be replaced
+# by a newer run of the same ref.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: mysql-honeypot-rs
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Windows -----------------------------------------------------
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            ext: .exe
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            ext: .exe
+          # --- macOS -------------------------------------------------------
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          # --- Linux -------------------------------------------------------
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            ext: ""
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            cross: true
+            ext: ""
+          - name: linux-riscv64
+            os: ubuntu-latest
+            target: riscv64gc-unknown-linux-gnu
+            cross: true
+            ext: ""
+          # `mips-unknown-linux-gnu` is a Tier 3 target: there is no prebuilt
+          # std, so this one builds core/std from source on nightly.
+          - name: linux-mips
+            os: ubuntu-latest
+            target: mips-unknown-linux-gnu
+            build_std: true
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and archive name
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          if [[ -n "$tag" ]]; then
+            version="$tag"
+          else
+            version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          fi
+          archive="${BIN_NAME}-${version}-${{ matrix.target }}.tar.gz"
+          echo "version=$version"   >> "$GITHUB_OUTPUT"
+          echo "archive=$archive"   >> "$GITHUB_OUTPUT"
+          echo "Building $archive"
+
+      # ---- toolchains -----------------------------------------------------
+      - name: Set up the MSVC developer shell (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install Rust (stable)
+        if: ${{ !matrix.build_std }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Rust (nightly + rust-src, for build-std)
+        if: ${{ matrix.build_std }}
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # The nightly build-std target writes to a different layout.
+          cache-on-failure: true
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install the MIPS cross toolchain
+        if: ${{ matrix.build_std }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mips-linux-gnu libc6-dev-mips-cross
+          mips-linux-gnu-gcc --version | head -n1
+
+      # ---- build ----------------------------------------------------------
+      - name: Build (native target)
+        if: ${{ !matrix.cross && !matrix.build_std }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (Tier 3, build-std)
+        if: ${{ matrix.build_std }}
+        env:
+          CARGO_TARGET_MIPS_UNKNOWN_LINUX_GNU_LINKER: mips-linux-gnu-gcc
+          CC_mips_unknown_linux_gnu: mips-linux-gnu-gcc
+          AR_mips_unknown_linux_gnu: mips-linux-gnu-ar
+        run: |
+          cargo build --release --locked \
+            --target ${{ matrix.target }} \
+            -Z build-std=std,panic_abort
+
+      # ---- package --------------------------------------------------------
+      - name: Package the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          archive="${{ steps.meta.outputs.archive }}"
+          staging="staging/${BIN_NAME}-${version}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          install -m 0755 "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}" "$staging/"
+          cp LICENSE README.md config.toml "$staging/"
+          tar -czf "$archive" -C staging "$(basename "$staging")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - name: Show the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          file "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}" || true
+          ls -la "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}"
+
+      - name: Upload the workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ steps.meta.outputs.archive }}
+            ${{ steps.meta.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Job summary
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo '```'
+            cat "${{ steps.meta.outputs.archive }}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Attach the archives to the GitHub release
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be uploaded
+        run: ls -la dist
+
+      - name: Upload the assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --clobber
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size) bytes"'

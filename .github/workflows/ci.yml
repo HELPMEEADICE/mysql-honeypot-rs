@@ -1,0 +1,95 @@
+# Continuous integration: formatting, lints and the full test suite on every
+# platform the project targets natively.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Documentation-only changes cannot break the build.
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+      - ".dockerignore"
+      - ".gitattributes"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      # `--` keeps `-D warnings` scoped to this crate: third-party crates are
+      # not written to be warning-free and must not fail the build.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      # Unit tests, the TCP integration suite and doc tests.
+      - run: cargo test --locked
+      # The release profile is what actually ships; build it here too.
+      - run: cargo build --release --locked
+
+  package:
+    name: cargo package contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - run: cargo package --locked --no-verify --allow-dirty
+      - name: Inspect the crate archive
+        run: |
+          set -euo pipefail
+          archive=$(echo target/package/mysql-honeypot-rs-*.crate)
+          listing=$(tar -tzf "$archive")
+          echo "$listing"
+          for expected in Cargo.toml LICENSE README.md src/main.rs src/lib.rs; do
+            grep -q "/$expected$" <<<"$listing" \
+              || { echo "::error::missing $expected from the crate archive"; exit 1; }
+          done

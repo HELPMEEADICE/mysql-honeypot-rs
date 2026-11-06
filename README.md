@@ -376,6 +376,70 @@ verified separately: the listener binds `::1`, the client connects, and
 
 ---
 
+### 9.1 CI and release builds
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+**`ci.yml`** runs on every push to `main`, every pull request and on demand:
+
+| Job | What it proves |
+| --- | --- |
+| `rustfmt` | `cargo fmt --all -- --check` |
+| `clippy` | `cargo clippy --all-targets --locked -- -D warnings` |
+| `test` (ubuntu / windows / macos) | `cargo test --locked` (66 unit + 15 integration + doc tests) and a `--release` build |
+| `package` | `cargo package` still produces a crate archive containing `LICENSE`, `README.md`, `src/main.rs`, `src/lib.rs` |
+
+`-D warnings` is passed after `--` so it applies to this crate only; third-party
+crates are never built with it.
+
+**`build.yml`** produces release binaries for nine targets and can be started in
+two ways:
+
+```bash
+# 1) publish a GitHub release — assets are attached to it automatically
+gh release create v0.1.0 --title "v0.1.0" --notes "first release"
+# 2) or run it manually — archives appear under the run's "Artifacts" section
+gh workflow run build.yml --ref main
+```
+
+| Target triple | Runner | Toolchain |
+| --- | --- | --- |
+| `x86_64-pc-windows-msvc` | windows-latest | stable, MSVC x64 dev shell |
+| `aarch64-pc-windows-msvc` | windows-latest | stable, MSVC arm64 dev shell |
+| `x86_64-apple-darwin` | macos-latest | stable |
+| `aarch64-apple-darwin` | macos-latest | stable |
+| `x86_64-unknown-linux-gnu` | ubuntu-latest | stable |
+| `aarch64-unknown-linux-gnu` | ubuntu-latest | stable + `cross` |
+| `armv7-unknown-linux-gnueabihf` | ubuntu-latest | stable + `cross` |
+| `riscv64gc-unknown-linux-gnu` | ubuntu-latest | stable + `cross` |
+| `mips-unknown-linux-gnu` | ubuntu-latest | nightly + `-Z build-std` (Tier 3: no prebuilt std) |
+
+Each job publishes `mysql-honeypot-rs-<version>-<triple>.tar.gz` containing the
+binary, `LICENSE`, `README.md` and `config.toml`, plus a matching `.sha256`.
+
+The release profile used by those builds is deliberately maximal:
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = false
+incremental = false
+overflow-checks = false
+```
+
+Note the consequence of `panic = "abort"`: a panic anywhere terminates the whole
+process rather than unwinding a single session task. The parser and the session
+state machine are written and tested to be panic-free on hostile input
+(`random_garbage_never_kills_the_server`), but if you prefer per-session
+isolation at the cost of a slightly larger binary, switch that line back to the
+default `unwind`.
+
+---
+
 ## 10. Known limitations
 
 * **No TLS.** `CLIENT_SSL` is not advertised and an `SSLRequest` is refused. A
