@@ -13,6 +13,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "Optional comma separated subset of matrix names (e.g. linux-mips,windows-aarch64). Empty builds everything."
+        required: false
+        default: ""
 
 # A release build must never be cancelled half-way, and must never be replaced
 # by a newer run of the same ref.
@@ -32,6 +37,12 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # `inputs.targets` only exists for workflow_dispatch; every other event
+    # builds the full matrix.
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.targets == ''
+          || contains(format(',{0},', inputs.targets), format(',{0},', matrix.name)) }}
     strategy:
       fail-fast: false
       matrix:
@@ -77,9 +88,11 @@ jobs:
             cross: true
             ext: ""
           # `mips-unknown-linux-gnu` is a Tier 3 target: there is no prebuilt
-          # std, so this one builds core/std from source on nightly.
+          # std, so this one builds core/std from source on nightly. It also
+          # needs the Debian/Ubuntu mips cross toolchain, which was dropped from
+          # the rolling `ubuntu-latest` (26.04) — hence the pinned 24.04 image.
           - name: linux-mips
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: mips-unknown-linux-gnu
             build_std: true
             ext: ""
@@ -109,6 +122,44 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.arch }}
+
+      # Git for Windows ships `C:\Program Files\Git\usr\bin\link.exe` (coreutils
+      # `link`), which shadows the MSVC linker for the ARM64 target. Put the
+      # real toolchain first and make sure the ARM64 SDK libs are on LIB.
+      - name: Point the linker at MSVC (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = '${{ matrix.arch }}'
+          if (-not $env:VCToolsInstallDir) {
+            throw "VCToolsInstallDir is empty: the MSVC developer shell was not initialised"
+          }
+          $msvcBin = Join-Path $env:VCToolsInstallDir "bin\Hostx64\$arch"
+          if (-not (Test-Path (Join-Path $msvcBin 'link.exe'))) {
+            throw "no link.exe in $msvcBin"
+          }
+          $msvcBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          $sdk = $env:WindowsSdkDir
+          $ver = $env:WindowsSDKVersion
+          if ($sdk -and $ver) {
+            $ver = $ver.TrimEnd('\')
+            $libs = @(
+              (Join-Path $sdk "Lib\$ver\ucrt\$arch"),
+              (Join-Path $sdk "Lib\$ver\um\$arch")
+            ) | Where-Object { Test-Path $_ }
+            if ($libs) {
+              "LIB=$($libs -join ';');$env:LIB" |
+                Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+          Write-Host "arch              : $arch"
+          Write-Host "VCToolsInstallDir : $env:VCToolsInstallDir"
+          Write-Host "msvcBin           : $msvcBin"
+          Write-Host "WindowsSdkDir     : $sdk"
+          Write-Host "LIB               : $env:LIB"
+          Write-Host "PATH (head)       : $($env:PATH.Split(';')[0..3] -join ' | ')"
 
       - name: Install Rust (stable)
         if: ${{ !matrix.build_std }}
