@@ -1,0 +1,11 @@
+target/
+honeypot.db
+honeypot.db-wal
+honeypot.db-shm
+server.log
+server.err
+scripts/__pycache__/
+*.pyc
+.git/
+.vscode/
+.idea/

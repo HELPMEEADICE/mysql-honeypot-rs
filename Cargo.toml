@@ -1,0 +1,27 @@
+[package]
+name = "mysql-honeypot-rs"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A lightweight, low-memory MySQL honeypot in Rust: accepts any credentials, delays each login by a random 2-6s and logs every statement to SQLite."
+repository = "https://github.com/HELPMEEADICE/mysql-honeypot-rs"
+readme = "README.md"
+keywords = ["honeypot", "mysql", "security", "sqlite"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+rand = "0.10.3"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+toml = "1.2.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[profile.release]
+# Small and fast enough for a honeypot; `panic = "abort"` is deliberately NOT
+# set so a panic can never take down more than the session that caused it.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

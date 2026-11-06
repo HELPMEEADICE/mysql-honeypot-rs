@@ -1,0 +1,26 @@
+[server]
+host = "0.0.0.0"
+port = 3306
+version = "8.0.36"
+max_connections = 256
+idle_timeout_seconds = 300
+handshake_timeout_seconds = 10
+max_packet_size = 1048576
+max_sql_length = 16384
+shutdown_grace_seconds = 10
+
+[authentication]
+always_accept = true
+delay_min_ms = 2000
+delay_max_ms = 6000
+
+[database]
+# /data is the container's single writable mount.
+sqlite_path = "/data/honeypot.db"
+enable_wal = true
+queue_capacity = 4096
+busy_timeout_ms = 5000
+
+[logging]
+level = "info"
+log_queries = true

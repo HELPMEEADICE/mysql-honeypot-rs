@@ -1,0 +1,10 @@
+# Normalise line endings for a cross-platform Rust project.
+* text=auto eol=lf
+
+# Generated/runtime artefacts must never be treated as text.
+*.db    binary
+*.db-wal binary
+*.db-shm binary
+*.png   binary
+*.jpg   binary
+*.ico   binary

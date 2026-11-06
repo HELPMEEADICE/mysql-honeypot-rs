@@ -1,0 +1,56 @@
+[Unit]
+Description=mysql-honeypot-rs — lightweight MySQL honeypot
+Documentation=https://example.invalid/mysql-honeypot-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mysql-honeypot
+Group=mysql-honeypot
+
+# The working directory holds honeypot.db unless sqlite_path is absolute.
+WorkingDirectory=/var/lib/mysql-honeypot
+ExecStart=/usr/local/bin/mysql-honeypot-rs --config /etc/mysql-honeypot/config.toml
+
+Restart=always
+RestartSec=3s
+
+# SIGTERM lets the listener stop accepting, close live sessions and flush the
+# log queue before the process exits.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# ---- hardening -----------------------------------------------------------
+# Port 3306 is above 1024, so no capabilities are needed at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The SQLite database (and its -wal/-shm siblings) is the only writable path.
+ReadWritePaths=/var/lib/mysql-honeypot
+StateDirectory=mysql-honeypot
+StateDirectoryMode=0750
+
+LimitNOFILE=8192
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

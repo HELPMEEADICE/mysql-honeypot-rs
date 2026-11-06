@@ -1,0 +1,49 @@
+# mysql-honeypot-rs configuration
+#
+# The honeypot opens exactly one TCP listener (the port below). It serves no
+# HTTP, WebSocket or admin interface, and it never connects out to anything.
+
+[server]
+# Bind address. 0.0.0.0 exposes the trap on every interface.
+host = "0.0.0.0"
+# The only port this process ever listens on.
+port = 3306
+# Version string reported in the handshake, VERSION() and @@version.
+version = "8.0.36"
+# Maximum number of simultaneous sessions; extra clients get ERR 1040.
+max_connections = 256
+# Idle timeout for a logged-in session, in seconds.
+idle_timeout_seconds = 300
+# Deadline for a client to finish the handshake, in seconds.
+handshake_timeout_seconds = 10
+# Largest MySQL payload accepted from a client, in bytes (1 MiB).
+max_packet_size = 1048576
+# Bytes of each statement stored in SQLite (longer statements are clipped).
+max_sql_length = 16384
+# Grace period for in-flight sessions when SIGTERM/SIGINT arrives, in seconds.
+shutdown_grace_seconds = 5
+
+[authentication]
+# Accept every username/password pair. Set to false only for comparison runs,
+# in which case every login is refused after the same random delay.
+always_accept = true
+# Random delay applied to every login, uniform in [min, max], in milliseconds.
+delay_min_ms = 2000
+delay_max_ms = 6000
+
+[database]
+# SQLite file receiving the audit trail.
+sqlite_path = "./honeypot.db"
+# WAL keeps concurrent readers (your analysis queries) off the writer's back.
+enable_wal = true
+# Bounded log queue: when the disk cannot keep up, events are dropped and
+# counted instead of blocking sessions or growing memory.
+queue_capacity = 4096
+# How long SQLite waits for a lock before reporting SQLITE_BUSY, in ms.
+busy_timeout_ms = 5000
+
+[logging]
+# tracing filter: trace | debug | info | warn | error (or a full directive).
+level = "info"
+# Log one line per statement received (the database always records them all).
+log_queries = true
