@@ -159,8 +159,9 @@ pub enum Token {
     UserVar(String),
     /// `@@name` — a system variable, scope qualifier already stripped.
     SysVar(String),
-    /// A single `?` placeholder from a prepared statement.
-    Placeholder,
+    /// A `?` placeholder from a prepared statement, numbered from zero in the
+    /// order it appears in the statement text.
+    Placeholder(usize),
     /// An operator or punctuation character sequence.
     Sym(Sym),
 }
@@ -359,6 +360,7 @@ pub fn tokenize(input: &str) -> Option<Vec<Token>> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0usize;
+    let mut placeholder = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte.is_ascii_whitespace() {
@@ -425,7 +427,8 @@ pub fn tokenize(input: &str) -> Option<Vec<Token>> {
                 index = cursor;
             }
             b'?' => {
-                tokens.push(Token::Placeholder);
+                tokens.push(Token::Placeholder(placeholder));
+                placeholder += 1;
                 index += 1;
             }
             b'0'..=b'9' => {
@@ -551,6 +554,195 @@ pub fn strip_scope(name: &str) -> &str {
         }
     }
     name.trim()
+}
+
+// ---------------------------------------------------------------------------
+// Prepared statement parameter binding
+// ---------------------------------------------------------------------------
+
+/// How many `?` placeholders a statement contains.
+///
+/// The tokenizer is the reference: a `?` inside a string literal, a quoted
+/// identifier or a comment is *not* a placeholder, and the client numbers its
+/// parameters by exactly that rule. When the text cannot be tokenized at all
+/// (an unterminated literal, say) the raw scan below is used, because the client
+/// has still counted the same way.
+pub fn count_placeholders(input: &str) -> usize {
+    match tokenize(input) {
+        Some(tokens) => tokens
+            .iter()
+            .filter(|token| matches!(token, Token::Placeholder(_)))
+            .count(),
+        None => scan_placeholders(input),
+    }
+}
+
+/// Fallback `?` counter that skips quotes and comments without building tokens.
+fn scan_placeholders(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' && quote != b'`' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == quote {
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+                continue;
+            }
+            b'?' => count += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    count
+}
+
+/// Replace every placeholder token with the typed literal it was bound to.
+///
+/// This is deliberately *not* a textual `replace("?", value)`: the substitution
+/// happens on the token stream, so a `?` that happens to sit inside a string
+/// literal, a quoted identifier or a comment is left alone, and a bound value
+/// keeps its type instead of being spliced into the SQL text (which would let a
+/// `'` in a bound string change the meaning of the statement).
+///
+/// A placeholder with no matching parameter becomes `NULL`, which is what an
+/// unbound parameter has always evaluated to here.
+pub fn bind_placeholders(tokens: &[Token], params: &[Value]) -> Vec<Token> {
+    let mut bound = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match token {
+            Token::Placeholder(index) => match params.get(*index) {
+                None | Some(Value::Null) => bound.push(Token::Word("NULL".to_string())),
+                Some(Value::Int(number)) => bound.push(Token::Num(Value::Int(*number))),
+                Some(Value::Float(number)) => bound.push(Token::Num(Value::Float(*number))),
+                Some(Value::Text(text)) => bound.push(Token::Str(text.clone())),
+            },
+            other => bound.push(other.clone()),
+        }
+    }
+    bound
+}
+
+/// Render a statement with its placeholders replaced by the literals that were
+/// bound, for the audit trail only — never for execution.
+///
+/// A statement that cannot be tokenized is returned unchanged, so the audit row
+/// still records exactly what the client sent.
+pub fn render_bound_statement(sql: &str, params: &[Value]) -> String {
+    if params.is_empty() {
+        return sql.to_string();
+    }
+    match tokenize(sql) {
+        Some(tokens) => render_tokens(&bind_placeholders(&tokens, params)),
+        None => sql.to_string(),
+    }
+}
+
+/// Render a token stream back to readable SQL.
+///
+/// Spacing follows the shape a human would write, which matters because the
+/// output is what the audit trail stores: `app_prod.users` must not come out as
+/// `app_prod. users`, or an operator searching the log for the table name would
+/// miss the row.
+pub fn render_tokens(tokens: &[Token]) -> String {
+    fn push_word(out: &mut String, text: &str) {
+        if !out.is_empty() && !out.ends_with([' ', '(', '.', '@']) {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            Token::Word(word) => push_word(&mut out, word),
+            Token::Quoted(name) => push_word(&mut out, &format!("`{}`", name.replace('`', "``"))),
+            Token::Str(text) => {
+                let mut quoted = String::with_capacity(text.len() + 2);
+                quoted.push('\'');
+                for character in text.chars() {
+                    if character == '\'' {
+                        quoted.push('\'');
+                    }
+                    quoted.push(character);
+                }
+                quoted.push('\'');
+                push_word(&mut out, &quoted);
+            }
+            Token::Num(value) => push_word(&mut out, &value.to_wire().unwrap_or_default()),
+            Token::UserVar(name) => push_word(&mut out, &format!("@{name}")),
+            Token::SysVar(name) => push_word(&mut out, &format!("@@{name}")),
+            Token::Placeholder(_) => push_word(&mut out, "?"),
+            Token::Sym(symbol) => {
+                let text = match symbol {
+                    Sym::LParen => "(",
+                    Sym::RParen => ")",
+                    Sym::Comma => ",",
+                    Sym::Dot => ".",
+                    Sym::Star => "*",
+                    Sym::Plus => "+",
+                    Sym::Minus => "-",
+                    Sym::Slash => "/",
+                    Sym::Percent => "%",
+                    Sym::Eq => "=",
+                    Sym::NotEq => "<>",
+                    Sym::Lt => "<",
+                    Sym::Le => "<=",
+                    Sym::Gt => ">",
+                    Sym::Ge => ">=",
+                    Sym::Semicolon => ";",
+                };
+                match symbol {
+                    // Tight punctuation never takes a leading space.
+                    Sym::RParen | Sym::Comma | Sym::Dot | Sym::Semicolon => out.push_str(text),
+                    Sym::LParen => {
+                        if !out.is_empty() && !out.ends_with(' ') {
+                            out.push(' ');
+                        }
+                        out.push('(');
+                    }
+                    // Operators read better with space on both sides.
+                    _ => {
+                        if !out.is_empty() && !out.ends_with(' ') {
+                            out.push(' ');
+                        }
+                        out.push_str(text);
+                        out.push(' ');
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +1093,7 @@ fn parse_primary(
     let expression = match token {
         Token::Str(text) => Expr::Literal(Value::Text(text.clone())),
         Token::Num(value) => Expr::Literal(value.clone()),
-        Token::Placeholder => Expr::Literal(Value::Null),
+        Token::Placeholder(_) => Expr::Literal(Value::Null),
         Token::UserVar(name) => Expr::UserVar(name.clone()),
         Token::SysVar(name) => Expr::SysVar(name.clone()),
         Token::Quoted(name) => Expr::Column(name.to_ascii_lowercase()),
@@ -1090,7 +1282,7 @@ mod tests {
         assert_eq!(tokens[2], Token::Num(Value::Float(1000.0)));
         assert_eq!(tokens[3], Token::UserVar("a".into()));
         assert_eq!(tokens[4], Token::SysVar("version".into()));
-        assert_eq!(tokens[5], Token::Placeholder);
+        assert_eq!(tokens[5], Token::Placeholder(0));
     }
 
     #[test]
@@ -1217,5 +1409,159 @@ mod tests {
         assert_eq!(format_float(12.0), "12");
         assert_eq!(format_float(12.5), "12.5");
         assert_eq!(format_float(-0.5), "-0.5");
+    }
+
+    // -- prepared statement binding -----------------------------------------
+
+    fn parse_bound(sql: &str, params: &[Value]) -> Option<Expr> {
+        let tokens = tokenize(sql)?;
+        let bound = bind_placeholders(&tokens, params);
+        let mut budget = Budget::new(MAX_TOKENS);
+        parse_expression(&bound, &mut budget)
+    }
+
+    #[test]
+    fn placeholders_are_numbered_in_order_of_appearance() {
+        let tokens = tokenize("a = ? AND b = ? AND c = ?").expect("tokens");
+        let indices: Vec<usize> = tokens
+            .iter()
+            .filter_map(|token| match token {
+                Token::Placeholder(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_question_mark_inside_a_literal_or_comment_is_not_a_placeholder() {
+        assert_eq!(count_placeholders("SELECT '?', ?"), 1);
+        assert_eq!(count_placeholders("SELECT \"?\", ?"), 1);
+        assert_eq!(count_placeholders("SELECT `?`, ?"), 1);
+        assert_eq!(count_placeholders("SELECT 1 -- ?\n, ?"), 1);
+        assert_eq!(count_placeholders("SELECT 1 # ?\n, ?"), 1);
+        assert_eq!(count_placeholders("SELECT 1 /* ? */, ?"), 1);
+        assert_eq!(count_placeholders("SELECT ?, ?"), 2);
+        // An unterminated literal cannot be tokenized; the raw scan treats the
+        // `?` as part of the broken literal, which matches how the reference
+        // tokenizer reads it. Under-counting is the safe direction: an unbound
+        // placeholder evaluates to NULL and matches fewer rows, never more.
+        assert_eq!(count_placeholders("SELECT 'unterminated ?"), 0);
+    }
+
+    #[test]
+    fn binding_keeps_the_type_of_the_bound_value() {
+        match parse_bound("id = ?", &[Value::Int(7)]) {
+            Some(Expr::Binary(BinOp::Eq, _, right)) => {
+                assert_eq!(*right, Expr::Literal(Value::Int(7)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_bound("score > ?", &[Value::Float(2.5)]) {
+            Some(Expr::Binary(BinOp::Gt, _, right)) => {
+                assert_eq!(*right, Expr::Literal(Value::Float(2.5)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_bound("name = ?", &[Value::Text("alice".into())]) {
+            Some(Expr::Binary(BinOp::Eq, _, right)) => {
+                assert_eq!(*right, Expr::Literal(Value::Text("alice".into())));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_bound("name = ?", &[Value::Null]) {
+            Some(Expr::Binary(BinOp::Eq, _, right)) => {
+                assert_eq!(*right, Expr::Literal(Value::Null));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binding_never_rewrites_a_question_mark_inside_a_string() {
+        // The whole point of binding on the token stream: a bound value can
+        // never change the shape of the statement, and a literal `?` is not a
+        // parameter.
+        let expression = parse_bound("name = '?' AND id = ?", &[Value::Int(1)]).expect("parse");
+        assert_eq!(
+            expression,
+            Expr::Binary(
+                BinOp::And,
+                Box::new(Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(Expr::Column("name".to_string())),
+                    Box::new(Expr::Literal(Value::Text("?".to_string()))),
+                )),
+                Box::new(Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(Expr::Column("id".to_string())),
+                    Box::new(Expr::Literal(Value::Int(1))),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn a_bound_string_cannot_escape_into_sql_syntax() {
+        // `' OR 1=1 -- ` as a value must stay one opaque string.
+        let expression =
+            parse_bound("name = ?", &[Value::Text("' OR 1=1 -- ".into())]).expect("parse");
+        assert_eq!(
+            expression,
+            Expr::Binary(
+                BinOp::Eq,
+                Box::new(Expr::Column("name".to_string())),
+                Box::new(Expr::Literal(Value::Text("' OR 1=1 -- ".to_string()))),
+            )
+        );
+    }
+
+    #[test]
+    fn a_missing_parameter_binds_to_null() {
+        match parse_bound("name = ? AND id = ?", &[Value::Text("x".into())]) {
+            Some(Expr::Binary(BinOp::And, _, right)) => {
+                assert_eq!(
+                    *right,
+                    Expr::Binary(
+                        BinOp::Eq,
+                        Box::new(Expr::Column("id".to_string())),
+                        Box::new(Expr::Literal(Value::Null)),
+                    )
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_audit_rendering_is_readable_sql() {
+        // The rendered text is what an operator greps for, so the qualified
+        // table name has to survive intact.
+        assert_eq!(
+            render_bound_statement(
+                "UPDATE app_prod.users SET role = ? WHERE id = ?",
+                &[Value::Text("auditor".into()), Value::Int(2)],
+            ),
+            "UPDATE app_prod.users SET role = 'auditor' WHERE id = 2"
+        );
+        assert_eq!(
+            render_bound_statement("SELECT a, b FROM t WHERE a = ?", &[Value::Int(1)]),
+            "SELECT a, b FROM t WHERE a = 1"
+        );
+        // A quote inside a bound value is doubled, never allowed to escape.
+        assert_eq!(
+            render_bound_statement("SELECT ?", &[Value::Text("o'brien".into())]),
+            "SELECT 'o''brien'"
+        );
+        // Nothing bound: the statement is returned untouched.
+        assert_eq!(
+            render_bound_statement("SELECT 1", &[]),
+            "SELECT 1".to_string()
+        );
+        // Untokenizable input is passed through verbatim rather than mangled.
+        assert_eq!(
+            render_bound_statement("SELECT 'unterminated ?", &[Value::Int(1)]),
+            "SELECT 'unterminated ?".to_string()
+        );
     }
 }

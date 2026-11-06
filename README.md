@@ -139,6 +139,8 @@ max_rows_per_table = 1000         # rows one virtual table may hold
 max_total_rows = 2000             # rows across the whole overlay
 max_string_bytes = 1024           # bytes in one stored string value
 max_total_bytes = 65536           # bytes of overlay storage per session (64 KiB)
+max_tombstones = 64               # DROP markers one session may accumulate
+max_columns_per_table = 128       # columns one CREATE TABLE may define
 ```
 
 Every value is clamped into a usable range at startup (for example a
@@ -153,7 +155,9 @@ tools react to a "wrong password".
 `enabled = false` makes every write a bare `OK` with no stored state at all,
 which is the cheapest possible profile; the budgets are what stop a
 `CREATE TABLE` / `INSERT` loop from growing the process, so lowering them is the
-right move on a memory-constrained host.
+right move on a memory-constrained host. `max_tombstones` and
+`max_columns_per_table` were added in this release; omitting them keeps the
+defaults, so an existing `config.toml` needs no edits.
 
 ---
 
@@ -234,19 +238,47 @@ an operator-side TCP check against port 3306 instead.
 | Packets | `OK`, `ERR` (with SQLSTATE), `EOF`, `AuthMoreData`, `AuthSwitchRequest`, `ColumnDefinition41`, text row |
 | Result sets | Column count → column definitions → EOF → rows → EOF, and the `CLIENT_DEPRECATE_EOF` variant |
 | Commands | `COM_QUERY`, `COM_PING`, `COM_INIT_DB`, `COM_QUIT`, `COM_STATISTICS`, `COM_PROCESS_INFO`, `COM_FIELD_LIST`, `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, `COM_SET_OPTION`, `COM_DEBUG` |
-| Prepared statements | `COM_STMT_PREPARE` (metadata: parameter and column definitions), `COM_STMT_EXECUTE` (binary result sets), `COM_STMT_CLOSE`, `COM_STMT_RESET`, `COM_STMT_SEND_LONG_DATA` |
-| Refused cleanly | `COM_STMT_FETCH` (no cursors) → `ERR 1295`, unknown statement handle → `ERR 1243`, unknown command → `ERR 1047` |
+| Prepared statements | `COM_STMT_PREPARE` (metadata: parameter and column definitions), `COM_STMT_EXECUTE` (**real typed parameter binding** + binary result sets), `COM_STMT_CLOSE`, `COM_STMT_RESET`, `COM_STMT_SEND_LONG_DATA` |
+| Refused cleanly | `COM_STMT_FETCH` (no cursors) → `ERR 1295`, cursor execute → `ERR 1295`, malformed parameter block → `ERR 1210`, unknown statement handle → `ERR 1243`, unknown command → `ERR 1047` |
 
 `COM_CHANGE_USER` is handled as a real identity switch: the new login name and
-database are adopted, the session's virtual database is reset exactly as MySQL
-resets it, an `OK` packet confirms the switch, and both the `connections` row and
-a `CHANGE_USER` audit entry record it.
+database are adopted, the session's virtual database **and** its prepared
+statements are reset exactly as MySQL resets them, an `OK` packet confirms the
+switch, and both the `connections` row and a `CHANGE_USER` audit entry record it.
+The adopted login name is clipped to 128 bytes before it is stored, because it
+lives for the whole session and appears in every log line.
 
 Prepared statements answer with the binary row format (`0x00` header, NULL
 bitmap, then typed values). Numeric columns are re-typed from the actual page, so
 `SELECT COUNT(*)` through `COM_STMT_EXECUTE` returns an integer, not a string.
 
-### 5.1 Authentication plugins
+### 5.1 Prepared-statement parameter binding
+
+`COM_STMT_EXECUTE` parameters are decoded as **typed data** (`src/protocol/execute.rs`)
+and bound onto the token stream, never spliced into the SQL text. A `?` that sits
+inside a string literal, a quoted identifier or a comment is therefore not a
+placeholder, and a bound value can never change the shape of the statement — a
+parameter containing `' OR 1=1 -- ` is just a string that matches nothing.
+
+| Wire types accepted as parameters | Decoded as |
+| --- | --- |
+| `TINY`, `SHORT`, `LONG`, `INT24`, `LONGLONG`, `YEAR` | integer, honouring the unsigned flag |
+| `FLOAT`, `DOUBLE` | double precision number |
+| `NULL` (type or NULL bitmap) | SQL `NULL` |
+| `DECIMAL`, `NEWDECIMAL`, `VARCHAR`, `VAR_STRING`, `STRING`, `BLOB` family, `BIT`, `JSON`, `ENUM`, `SET`, `GEOMETRY`, temporal types | text |
+
+Also enforced: the parameter count must match the statement, `iteration_count`
+must be `1`, `new_params_bound_flag = 0` reuses the previous execute's types (and
+is refused when there is nothing to reuse), `COM_STMT_RESET` clears that cache,
+and a parameter longer than 64 KiB is refused instead of materialised. Unknown
+wire types and cursor requests are answered with the MySQL error a real server
+sends rather than guessed at.
+
+The audit trail stores the statement with the bound values rendered in, so the
+row matches what actually executed. The handshake and `COM_CHANGE_USER`
+authentication responses are never logged.
+
+### 5.2 Authentication plugins
 
 Authentication is **unconditional**: no credential is ever verified, and the
 scrambled `auth_response` is parsed but discarded (never logged, never stored).
@@ -352,7 +384,54 @@ just created really is listed.
 Nothing here touches a real database, the filesystem or the network: it is a
 bounded in-memory map of `String`s behind the budgets in `[virtualdb]`. Exceeding
 a budget produces the MySQL error a real server would produce (`ER_TOO_MANY_TABLES`,
-`ER_RECORD_FILE_FULL`, `ER_DATA_TOO_LONG`) rather than growing without limit.
+`ER_RECORD_FILE_FULL`, `ER_DATA_TOO_LONG`, `ER_TOO_MANY_FIELDS`) rather than
+growing without limit.
+
+#### Mutation is atomic and accounted
+
+Every write goes through one of five methods on `SessionState` (`insert_rows`,
+`replace_rows`, `update_rows`, `delete_rows`, `truncate_table`); SQL executors
+never touch `table.rows` directly. Each method upholds two invariants:
+
+* **after success** the byte and row counters equal the real content of the
+  overlay — row containers, cell slots, column definitions, schema shells, `DROP`
+  tombstones and `SET @var` values included. `SessionState::recount()` recomputes
+  both from scratch and is asserted against the incremental counters in the test
+  suite after every mutation shape;
+* **after failure** nothing changed. Every limit is validated against the
+  *would-be* state before the first byte is written, so a rejected statement can
+  never leave a half-applied row set behind. A multi-row `INSERT` is all or
+  nothing, and a `REPLACE` that would exceed the budget does not delete the row
+  it was going to replace.
+
+`DELETE` and `TRUNCATE` give their bytes back, `UPDATE` re-checks the string and
+byte budgets for the new values, and `attach()` (the copy-on-write clone) is
+idempotent: a repeated write to the same table never charges the budget twice.
+
+#### `DROP` tombstones
+
+A `DROP TABLE` only needs a marker when the **base catalog** still holds the
+table — a table the session invented disappears with its overlay entry. That
+distinction is what keeps a `CREATE`/`DROP` loop over ever new names from
+accumulating markers. Repeated drops of the same table are deduplicated, the
+tombstone count is capped by `[virtualdb].max_tombstones` and their bytes count
+against `max_total_bytes`, and dropping a whole schema releases the table markers
+that the schema marker already implies.
+
+#### Sorting and grouping use the declared type
+
+`ORDER BY`, `GROUP BY`, `MIN`/`MAX` and `WHERE` share one comparison rule, so they
+can never contradict each other. A numeric column sorts by value (`9` before
+`10`), a text column sorts by the advertised `utf8mb4_0900_ai_ci` collation
+(`admin < alice < bob`), and `NULL` sorts before every other value ascending (and
+therefore last descending). Sorting keys are materialised once per row, which
+makes the comparator allocation free and a genuine total order — `slice::sort_by`
+is allowed to panic on a comparator that is not.
+
+`UPDATE ... ORDER BY ... LIMIT` and `DELETE ... ORDER BY ... LIMIT` touch rows in
+sorted order rather than storage order, and report the row count they actually
+changed.
+
 
 ---
 
@@ -404,11 +483,37 @@ Three reliability properties are enforced by the writer:
   fails inside a batch is counted in `failed` instead of being absorbed into a
   successful commit. The final tallies are logged when the process stops.
 
-`retention_days` and `max_size_bytes` are **off by default**: deleting forensic
-evidence should be an explicit decision. When `retention_days > 0`, rows older
-than that window are removed at startup; when `max_size_bytes > 0`, the oldest
-query rows are trimmed and the file compacted until it fits. Both operations run
-once, on the writer thread, before any session is accepted.
+`retention_days` and `max_size_bytes` are **off by default** (`0` means "keep
+everything"): deleting forensic evidence should be an explicit decision. When
+either is non-zero a bounded maintenance pass runs at startup **and then
+periodically** from the writer thread — never from a Tokio task, because every
+step is a blocking SQLite call:
+
+* rows older than `retention_days` are deleted in batches of 500, at most 20
+  batches per pass, and the pass repeats every 60 seconds until the backlog is
+  gone;
+* a query row is always removed together with the connection it belongs to, and
+  never after it, so retention cannot leave a query pointing at a connection that
+  no longer exists;
+* when `max_size_bytes > 0` the footprint is measured as the main file **plus the
+  `-wal` companion**, because the newest commits of a WAL database are not in the
+  main file. The trim target is the *live* page count (`page_count -
+  freelist_count`), which is what a `VACUUM` would leave behind — measuring the
+  raw file instead would keep deleting rows while the WAL grew and only compact
+  at the end, destroying far more data than the cap requires;
+* `VACUUM` runs at most once every 10 minutes and only after the cheap measures
+  failed, since it rewrites the whole database and would otherwise turn a size cap
+  into a periodic stall.
+
+**`max_size_bytes` is a soft bound, not a hard one.** SQLite cannot shrink below
+one page per table and index, the WAL has a floor of its own, and a database that
+is already small can report a larger footprint than the configured cap no matter
+what is deleted. When the cap cannot be met the honeypot logs
+`audit database is still above the configured size cap after a full cleanup pass`
+and keeps the remaining rows rather than deleting evidence it cannot legitimately
+remove. A start-up failure to open the database is still fatal; a failure to
+maintain it is logged and retried on the next pass.
+
 
 Useful queries:
 
@@ -452,15 +557,26 @@ earlier rows.
   of result bytes, 2 048 tokens per statement, 24 levels of expression nesting and
   512 parser steps. Exceeding the column or row budget is reported the way MySQL
   reports it (or silently paginated), never by allocating first.
-* The virtual database is bounded by `[virtualdb]` (table count, rows per table,
-  total rows, string length and total bytes per session).
+* `LIKE` carries a per-statement work budget (2 million character comparisons) and
+  a 1 024 character pattern cap, so a handful of `%a%a%a…` predicates over a full
+  table cannot pin a core. Once the budget is gone the predicate answers "no
+  match", which loses rows but never invents them.
+* The virtual database is bounded by `[virtualdb]`: table count, rows per table,
+  total rows, string length, total bytes and tombstone count per session, plus a
+  column cap per `CREATE TABLE`.
+* Prepared statements are bounded twice — at most 32 per session **and** at most
+  64 KiB of statement text in total — so a client cannot pin maximum-length
+  statements on every connection at once.
 * `SLEEP()` and `BENCHMARK()` return immediately, so neither can be used to hold
   a connection slot with server-side work.
 * SQLite failures (busy, disk full, corrupt handle) are retried once against a
   freshly opened connection; a batch that still fails is counted in `failed`
-  rather than retried forever.
-* Malformed input never panics: every decoder is bounds-checked, and a session
-  that misbehaves is closed while the process keeps serving.
+  rather than retried forever. A maintenance pass that cannot delete a batch logs
+  it and tries again on the next pass instead of spinning.
+* Malformed input never panics: every decoder is bounds-checked, every length is
+  converted with `try_from` rather than `as` (so 32-bit targets cannot truncate a
+  hostile length), and a session that misbehaves is closed while the process keeps
+  serving.
 * The runtime is multi-threaded and every network wait is `async`, so one
   client's 2–6 second delay never delays another.
 
@@ -477,7 +593,12 @@ cargo build --release --locked
 
 * `src/**` — unit tests for framing, length-encoded integers, handshake build and
   parse, OK/ERR/EOF/result-set encoders, config clamping, statement routing,
-  catalog construction, delay sampling and the SQLite writer.
+  catalog construction, delay sampling and the SQLite writer. The virtual
+  database and the SQL engine have their own suites: budget accounting
+  (`recount()` is asserted against the incremental counters after every mutation
+  shape), `DROP` tombstone bounds over thousands of `CREATE`/`DROP` cycles,
+  type-aware `ORDER BY`/`GROUP BY`/aggregates, atomic `INSERT`/`REPLACE`/
+  `UPDATE`, the DML error contract, and the prepared-statement binder.
 * `tests/integration.rs` — a real TCP client against a real listener on an
   ephemeral port: arbitrary credentials, the configured delay window,
   `SHOW DATABASES`, `SELECT 1`, long statement streams, malformed and truncated
@@ -485,8 +606,17 @@ cargo build --release --locked
   `DEPRECATE_EOF` and `mysql_native_password` paths, `COM_PING`/`COM_INIT_DB`/
   `COM_QUIT`, SQL truncation, log persistence across a restart, the handshake
   timeout, and — for the SQL engine — `COUNT(*)`/`WHERE`/`LIMIT`/`ORDER BY`
-  semantics, session isolation of the virtual database, prepared statements over
-  the binary protocol, `COM_CHANGE_USER` and the logger's counters.
+  semantics, session isolation of the virtual database, `COM_CHANGE_USER` and the
+  logger's counters. Prepared statements get their own wire-level tests: typed
+  binding, re-execution, type reuse, `COM_STMT_RESET`, `COM_STMT_CLOSE`, and
+  malformed/truncated/cursor executions.
+* `tests/hostile_surface.rs` — a deterministic stand-in for the `cargo-fuzz`
+  harnesses in `fuzz/`, so the hostile-input invariants also run on a stable
+  toolchain: the packet reader, handshake parsing, packet framing, hostile TOML
+  and mutated SQL, each over a seeded corpus.
+* `scripts/e2e_clients.py` — black-box verification with real drivers
+  (`pymysql`, `mysql.connector`, and a hand-written raw socket client), including
+  a check that a `mysql.connector` **prepared** cursor really binds parameters.
 * `fuzz/` — a `cargo-fuzz` crate with four targets (`packet`, `handshake`,
   `config`, `framing`). It is a separate workspace, so `cargo build`/`test`/
   `clippy` at the repository root are unaffected; run it with
@@ -602,33 +732,46 @@ default `unwind`.
 * **No TLS.** `CLIENT_SSL` is not advertised and an `SSLRequest` is refused. A
   client configured with `--ssl-mode=REQUIRED` will not connect — by design, so
   no client can believe it has an encrypted channel.
-* **Prepared statements ignore their parameters.** The binary protocol is
-  implemented end to end, but placeholder values are treated as `NULL`: a
-  `SELECT ... WHERE name = ?` returns no rows and the statement is logged as
-  `PREPARE`. The point is protocol compatibility, not result fidelity.
+* **Prepared statements bind parameters, but do not fully implement the binary
+  protocol.** `?` placeholders are bound as typed data and affect the result, and
+  `new_params_bound_flag`, `COM_STMT_RESET` and repeated execution are handled.
+  What is still missing: cursors (`COM_STMT_FETCH` → `ERR 1295`, a cursor execute
+  is refused up front), and `COM_STMT_SEND_LONG_DATA` is accepted and discarded —
+  a client that streams a parameter in chunks will find it unbound (`NULL`) at
+  execute time. `MYSQL_TYPE_GEOMETRY`/`BIT` parameters are read as text.
 * **Cursors are not implemented.** `COM_STMT_FETCH` answers `ERR 1295`.
 * **One statement per `COM_QUERY`.** `CLIENT_MULTI_STATEMENTS` is not advertised;
   extra statements in one payload are logged but only the first is answered.
 * **No `LOAD DATA LOCAL`, no compression.** Both capability flags stay off, so
   the honeypot can never be turned into a file transport.
-* **Unmodelled SQL degrades to an empty result.** `BETWEEN`, `XOR`, subqueries,
-  `CASE`, `JOIN`, `UNION`, `HAVING` and `GROUP BY` over expressions the parser
-  cannot fold produce fewer rows than a real server would, never more. The
-  response is tagged `degraded` so the audit trail shows it.
+* **Unmodelled SQL degrades to an empty result set — for `SELECT` only.** A
+  `SELECT` whose `WHERE`/`HAVING`/`GROUP BY` falls outside the grammar returns its
+  real column headers and **no rows**, tagged `degraded` so the audit trail shows
+  it. For DML the same situation is an error (`ERR 1235`,
+  `ER_NOT_SUPPORTED_YET`) with no state change: a statement that cannot be
+  filtered correctly must not pretend it ran.
 * **`SELECT ... FROM <table>` works without a database selected.** A real server
   answers `ERR 1046`; the honeypot searches every schema so a scanner that skips
   `USE` still sees the decoy tables. `SHOW TABLES` does require a schema, exactly
   like MySQL.
 * **MySQL error codes are approximated.** `ER_BAD_FIELD_ERROR`, `ER_NO_SUCH_TABLE`,
-  `ER_BAD_DB_ERROR`, `ER_DATA_TOO_LONG`, `ER_RECORD_FILE_FULL` and
+  `ER_BAD_DB_ERROR`, `ER_DATA_TOO_LONG`, `ER_RECORD_FILE_FULL`,
+  `ER_TOO_MANY_FIELDS`, `ER_NOT_SUPPORTED_YET`, `ER_WRONG_ARGUMENTS` and
   `ER_UNKNOWN_STMT_HANDLER` carry the real code, SQLSTATE and message shape, but
   the wording is not byte-identical to a specific 8.0 point release.
+* **`max_size_bytes` is a soft limit.** See §7: SQLite cannot shrink below one page
+  per object, the WAL has a floor, and the honeypot prefers keeping evidence over
+  deleting more than the cap requires.
 * **Connection ids on the wire are 32-bit**, so after 2^32 sessions the value
   reported by `CONNECTION_ID()` wraps while `connections.id` keeps growing.
 * **The `mysql` CLI was not available in the build environment** used for the
   reference run. Its protocol requirements (text result sets, `DEPRECATE_EOF`,
   `caching_sha2_password`) are covered by the raw-protocol integration client and
   by PyMySQL/`mysql.connector`, but the CLI binary itself was not executed here.
+* **`cargo-fuzz` was not available in this build environment** (it needs a nightly
+  toolchain). `tests/hostile_surface.rs` replays the same invariants over a seeded
+  corpus on the stable toolchain; the `fuzz/` harnesses are unchanged and still
+  build under `cargo +nightly fuzz run <target>`.
 
 ---
 

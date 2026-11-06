@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::auth;
 use crate::config::Config;
 use crate::fakedb::{self, FakeDatabase, QueryContext, QueryResult, SessionState};
+use crate::protocol::execute;
 use crate::protocol::handshake;
 use crate::protocol::packet::{PacketStream, PayloadReader};
 use crate::protocol::response::{self, ColumnDef};
@@ -32,6 +33,20 @@ const LOG_USERNAME_LIMIT: usize = 128;
 const LOG_CLIENT_INFO_LIMIT: usize = 512;
 /// Prepared statements one session may hold open.
 const MAX_PREPARED_STATEMENTS: usize = 32;
+
+/// Total statement text one session may pin with prepared statements.
+///
+/// `max_sql_length` bounds one statement; without a second bound a client could
+/// hold `MAX_PREPARED_STATEMENTS` statements of the maximum length open on every
+/// connection at once.
+const MAX_PREPARED_SQL_BYTES: usize = 64 * 1024;
+
+/// Bound on the rendered statement written to the audit database.
+///
+/// A prepared statement's bound values are rendered into the audit row so the
+/// record matches what actually executed; the rendering is clipped so a page of
+/// oversized parameters cannot bloat one audit row without limit.
+const MAX_AUDIT_SQL_BYTES: usize = 32 * 1024;
 /// Refusal replies that may be in flight at once.
 ///
 /// Without this cap, a connection flood turns every rejected socket into a
@@ -285,6 +300,11 @@ async fn handle_client(state: Arc<AppState>, stream: TcpStream, peer: SocketAddr
 struct PreparedStatement {
     id: u32,
     sql: String,
+    /// Placeholder count recorded at prepare time.
+    param_count: usize,
+    /// Parameter types of the previous execute, reused when the client clears
+    /// `new_params_bound_flag`.
+    param_types: Vec<execute::ParamType>,
 }
 
 /// Per-connection protocol state.
@@ -385,7 +405,10 @@ impl Session {
         };
 
         self.capabilities = parsed.capabilities;
-        self.username = parsed.username.clone();
+        // Bound the identity the session keeps in memory: the handshake payload
+        // is client controlled and can be most of a megabyte long, and this value
+        // lives for the whole session and feeds every log line.
+        self.username = clip(&parsed.username, LOG_USERNAME_LIMIT);
         if let Some(database) = parsed.database.as_ref().filter(|name| !name.is_empty()) {
             // The catalog must never contradict itself: an unknown schema is not
             // adopted, so `DATABASE()` stays NULL instead of naming a database
@@ -626,9 +649,22 @@ impl Session {
                     debug!(id = self.id, "STMT_SEND_LONG_DATA");
                 }
                 protocol::COM_STMT_RESET => {
+                    // `COM_STMT_RESET` discards accumulated long data and the
+                    // cached parameter types, so the next execute must resend
+                    // them. Answering OK without clearing them would let a client
+                    // reuse a stale type block and get wrong values bound.
+                    if let Some((id, _)) = split_statement_id(body)
+                        && let Some(statement) = self
+                            .prepared
+                            .iter_mut()
+                            .find(|statement| statement.id == id)
+                    {
+                        statement.param_types.clear();
+                    }
                     let ok =
                         response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
                     packets.write_packet(&ok).await?;
+                    debug!(id = self.id, "STMT_RESET");
                 }
                 protocol::COM_STMT_FETCH => {
                     // Cursors are not implemented; say so rather than sending a
@@ -676,7 +712,7 @@ impl Session {
         let plugin = reader.nul_str().unwrap_or_default();
 
         if !new_user.is_empty() {
-            self.username = new_user.clone();
+            self.username = clip(&new_user, LOG_USERNAME_LIMIT);
         }
         // A new user gets a clean virtual database, exactly like MySQL resetting
         // the session on `COM_CHANGE_USER`.
@@ -728,7 +764,9 @@ impl Session {
     ) -> Result<(), ProtocolError> {
         let raw = String::from_utf8_lossy(body).to_string();
         let (sql, truncated) = util::truncate_to(&raw, self.state.config.server.max_sql_length);
-        let parameters = count_placeholders(&sql);
+        // The tokenizer is the reference for how many placeholders the statement
+        // really contains: a `?` inside a literal or a comment is not one.
+        let parameters = fakedb::sql::count_placeholders(&sql);
         if parameters > u16::MAX as usize {
             let payload = response::err_payload(
                 self.capabilities,
@@ -741,12 +779,25 @@ impl Session {
         }
         let statement_id = self.next_statement_id;
         self.next_statement_id = self.next_statement_id.wrapping_add(1).max(1);
-        if self.prepared.len() >= MAX_PREPARED_STATEMENTS {
+        // Two bounds, both needed: the count alone would still let a client pin
+        // `MAX_PREPARED_STATEMENTS` maximum-length statements per connection.
+        while !self.prepared.is_empty()
+            && (self.prepared.len() >= MAX_PREPARED_STATEMENTS
+                || self
+                    .prepared
+                    .iter()
+                    .map(|statement| statement.sql.len())
+                    .sum::<usize>()
+                    .saturating_add(sql.len())
+                    > MAX_PREPARED_SQL_BYTES)
+        {
             self.prepared.remove(0);
         }
         self.prepared.push(PreparedStatement {
             id: statement_id,
             sql: sql.clone(),
+            param_count: parameters,
+            param_types: Vec::new(),
         });
 
         // Metadata the client will read immediately after the OK packet: the
@@ -821,41 +872,96 @@ impl Session {
         }
     }
 
-    /// `COM_STMT_EXECUTE`: run the stored statement and answer with a *binary*
-    /// result set, which is what the client expects after a prepare.
+    /// `COM_STMT_EXECUTE`: decode the bound parameters, run the stored statement
+    /// and answer with a *binary* result set, which is what the client expects
+    /// after a prepare.
     async fn execute_prepared(
         &mut self,
         packets: &mut PacketStream<TcpStream>,
         body: &[u8],
     ) -> Result<(), ProtocolError> {
         let Some((statement_id, _)) = split_statement_id(body) else {
-            let payload = response::err_payload(
-                self.capabilities,
+            self.write_stmt_error(
+                packets,
                 1243,
-                "HY000",
                 "Unknown prepared statement handler given to mysqld_stmt_execute",
-            );
-            packets.write_packet(&payload).await?;
+            )
+            .await?;
             return Ok(());
         };
-        let Some(sql) = self
+        let Some((sql, param_count, previous_types)) = self
             .prepared
             .iter()
             .find(|statement| statement.id == statement_id)
-            .map(|statement| statement.sql.clone())
+            .map(|statement| {
+                (
+                    statement.sql.clone(),
+                    statement.param_count,
+                    statement.param_types.clone(),
+                )
+            })
         else {
-            let payload = response::err_payload(
-                self.capabilities,
+            self.write_stmt_error(
+                packets,
                 1243,
-                "HY000",
                 "Unknown prepared statement handler given to mysqld_stmt_execute",
-            );
-            packets.write_packet(&payload).await?;
+            )
+            .await?;
             return Ok(());
         };
+
+        // Decode the typed parameter block. Anything malformed is reported as
+        // `ER_WRONG_ARGUMENTS`, exactly like a real server, and never reaches the
+        // evaluator.
+        let request = match execute::decode_execute(body, param_count, &previous_types) {
+            Ok(request) => request,
+            Err(err) => {
+                if let Some(statement) = self
+                    .prepared
+                    .iter_mut()
+                    .find(|statement| statement.id == statement_id)
+                {
+                    // A failed execute must not leave the reuse cache poisoned.
+                    statement.param_types.clear();
+                }
+                let payload = response::err_payload(
+                    self.capabilities,
+                    err.code(),
+                    err.sqlstate(),
+                    &err.message(),
+                );
+                packets.write_packet(&payload).await?;
+                debug!(id = self.id, code = err.code(), "STMT_EXECUTE refused");
+                self.record_query(sql, "EXECUTE", &format!("ERR({})", err.code()));
+                return Ok(());
+            }
+        };
+        if request.cursor {
+            // Cursors need `COM_STMT_FETCH`, which this server answers with
+            // `ER_UNSUPPORTED_PS`; pretending to open one would desynchronise the
+            // client, so refuse up front.
+            let payload = response::err_payload(
+                self.capabilities,
+                execute::ER_UNSUPPORTED_PS,
+                "HY000",
+                "Cursors are not supported in the prepared statement protocol yet",
+            );
+            packets.write_packet(&payload).await?;
+            self.record_query(sql, "EXECUTE", "ERR(cursor unsupported)");
+            return Ok(());
+        }
+        // Remember the types so a later execute may reuse them.
+        if let Some(statement) = self
+            .prepared
+            .iter_mut()
+            .find(|statement| statement.id == statement_id)
+        {
+            statement.param_types = request.param_types.clone();
+        }
+
         self.queries += 1;
         let query_type = fakedb::classify(&sql);
-        let context = self.context();
+        let context = self.context().with_params(request.values.clone());
         let result = self
             .state
             .database
@@ -864,11 +970,23 @@ impl Session {
             info!(
                 id = self.id,
                 kind = query_type,
+                params = request.values.len(),
                 sql = %preview(&sql),
                 "EXECUTE"
             );
         }
-        self.record_query(sql, query_type, &result.kind());
+        // The audit trail records what actually ran: the statement skeleton plus
+        // the bound values, rendered as the literals the client sent. The
+        // handshake and `COM_CHANGE_USER` authentication responses are never
+        // logged; a parameter value is part of the attempted statement exactly
+        // like a literal in a plain `COM_QUERY`.
+        let audited = if request.values.is_empty() {
+            sql
+        } else {
+            let rendered = fakedb::sql::render_bound_statement(&sql, &request.values);
+            clip(&rendered, MAX_AUDIT_SQL_BYTES)
+        };
+        self.record_query(audited, query_type, &result.kind());
         match result {
             QueryResult::ResultSet(set) => {
                 let columns: Vec<ColumnDef<'_>> = set
@@ -949,14 +1067,25 @@ impl Session {
         Ok(())
     }
 
+    /// Write an `ERR` packet for a prepared-statement command.
+    async fn write_stmt_error(
+        &self,
+        packets: &mut PacketStream<TcpStream>,
+        code: u16,
+        message: &str,
+    ) -> Result<(), ProtocolError> {
+        let payload = response::err_payload(self.capabilities, code, "HY000", message);
+        packets.write_packet(&payload).await
+    }
+
     fn context(&self) -> QueryContext {
-        QueryContext {
-            current_db: self.current_db.clone(),
-            username: self.username.clone(),
-            client_host: self.source_ip.clone(),
-            connection_id: self.id as u32,
-            server_version: self.state.config.server.version.clone(),
-        }
+        QueryContext::new(
+            self.current_db.clone(),
+            self.username.clone(),
+            self.source_ip.clone(),
+            self.id as u32,
+            self.state.config.server.version.clone(),
+        )
     }
 
     /// Run one `COM_QUERY` statement and stash its response.
@@ -1121,35 +1250,6 @@ fn split_statement_id(body: &[u8]) -> Option<(u32, usize)> {
     }
     let id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     Some((id, 4))
-}
-
-/// Count `?` placeholders outside string literals and quoted identifiers.
-fn count_placeholders(sql: &str) -> usize {
-    let bytes = sql.as_bytes();
-    let mut count = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[index];
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' && quote != b'`' {
-                        index += 2;
-                        continue;
-                    }
-                    if bytes[index] == quote {
-                        break;
-                    }
-                    index += 1;
-                }
-            }
-            b'?' => count += 1,
-            _ => {}
-        }
-        index += 1;
-    }
-    count
 }
 
 /// UTF-8 safe clip for log and database fields.

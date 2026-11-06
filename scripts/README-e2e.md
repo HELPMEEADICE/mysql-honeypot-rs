@@ -42,7 +42,7 @@ plugin 名 `caching_sha2_password`，auth response 为 32 字节随机）→ 识
 `OK(0x00)` / `ERR(0xff)` / `AuthMoreData(0x01, 0x03|0x04)` / `AuthSwitchRequest(0xfe)`，
 序列号双向递增。
 
-## 10 个检查项
+## 11 个检查项
 
 1. `pymysql` 用任意凭据认证成功（root/wrongpassword、admin/123456、test/随机串）
 2. `mysql.connector` 同上
@@ -54,6 +54,12 @@ plugin 名 `caching_sha2_password`，auth response 为 32 字节随机）→ 识
 8. 4 种畸形包（随机 200 字节 / 声明 0xFFFFFF 只发 10 字节 / 裸 4 字节 header / 合法认证后未知命令 0x7f）后，进程仍能被 `pymysql` 连上
 9. 并发 `--concurrency` 个连接全成功，且并发墙钟明显小于串行估算
 10. SQLite 日志核对（见下）
+11. `mysql.connector` 的 **prepared cursor**（`cursor(prepared=True)`）真实绑定参数：
+    `WHERE id = %s` 传 `1` 必须返回 `admin`，传 `3` 必须返回 `bob`（同一语句重复执行），
+    字符串参数 `alice` 必须命中，不存在的值必须返回空结果集，
+    绑定 `' OR 1=1 -- ` 这类载荷必须**不能**放宽谓词。这一项是唯一端到端验证
+    二进制协议参数块（`COM_STMT_EXECUTE` 的 NULL bitmap、类型块与取值）的检查，
+    没有它，`?` 被当作 NULL 与真正绑定在外部表现上无法区分。
 
 ## SQLite 审计（检查 10）
 

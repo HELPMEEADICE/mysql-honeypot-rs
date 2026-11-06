@@ -313,17 +313,46 @@ pub struct QueryContext {
     pub connection_id: u32,
     /// Advertised server version.
     pub server_version: String,
+    /// Values bound to the `?` placeholders of a prepared statement.
+    ///
+    /// Empty for a plain `COM_QUERY`. Binding happens on the token stream, so a
+    /// bound value can never change the shape of the statement.
+    pub params: Vec<Value>,
 }
 
 impl QueryContext {
-    fn eval_context(&self) -> EvalContext {
-        EvalContext {
-            current_db: self.current_db.clone(),
-            username: util::clip(&self.username, 64),
-            client_host: util::clip(&self.client_host, 64),
-            connection_id: self.connection_id,
-            server_version: self.server_version.clone(),
+    /// A context for a plain, unparameterised statement.
+    pub fn new(
+        current_db: String,
+        username: String,
+        client_host: String,
+        connection_id: u32,
+        server_version: String,
+    ) -> Self {
+        Self {
+            current_db,
+            username,
+            client_host,
+            connection_id,
+            server_version,
+            params: Vec::new(),
         }
+    }
+
+    /// The same context with prepared-statement parameters attached.
+    pub fn with_params(mut self, params: Vec<Value>) -> Self {
+        self.params = params;
+        self
+    }
+
+    fn eval_context(&self) -> EvalContext {
+        EvalContext::new(
+            self.current_db.clone(),
+            util::clip(&self.username, 64),
+            util::clip(&self.client_host, 64),
+            self.connection_id,
+            self.server_version.clone(),
+        )
     }
 }
 
@@ -402,6 +431,30 @@ impl FakeDatabase {
             .iter()
             .any(|schema| schema.name.eq_ignore_ascii_case(name))
             || state.owns_schema(name)
+    }
+
+    /// Whether the *base* catalog — not the session overlay — holds `schema`.
+    ///
+    /// A `DROP` only needs a tombstone when there is something in the base
+    /// catalog to hide; a table or schema the session invented disappears with
+    /// its overlay entry alone.
+    fn base_has_schema(&self, schema: &str) -> bool {
+        self.schemas
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(schema))
+    }
+
+    /// Whether the base catalog holds `schema.table`.
+    fn base_has_table(&self, schema: &str, table: &str) -> bool {
+        self.schemas
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(schema))
+            .is_some_and(|found| {
+                found
+                    .tables
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(table))
+            })
     }
 
     /// Every `(schema, table)` pair visible to `state`.
@@ -662,6 +715,20 @@ impl FakeDatabase {
     // Dispatch
     // -----------------------------------------------------------------------
 
+    /// Tokenize a statement fragment and bind its `?` placeholders.
+    ///
+    /// Binding is a token-level rewrite of [`Token::Placeholder`] into the typed
+    /// literal that was sent in the binary protocol, never a textual
+    /// `replace("?", value)`.
+    fn tokens(&self, text: &str, ctx: &QueryContext) -> Option<Vec<Token>> {
+        let tokens = sql::tokenize(text)?;
+        if ctx.params.is_empty() {
+            Some(tokens)
+        } else {
+            Some(sql::bind_placeholders(&tokens, &ctx.params))
+        }
+    }
+
     /// Route one statement to a plausible response.
     pub fn dispatch(&self, sql: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
         let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -710,7 +777,7 @@ impl FakeDatabase {
     // -----------------------------------------------------------------------
 
     fn select(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let Some(from_index) = find_top_level_keyword(&tokens, "FROM") else {
@@ -1286,7 +1353,7 @@ impl FakeDatabase {
     // -----------------------------------------------------------------------
 
     fn set(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         // `SET @name = expr` is the only assignment worth keeping: it is what
@@ -1337,48 +1404,31 @@ impl FakeDatabase {
     // DML
     // -----------------------------------------------------------------------
 
-    fn writable_table<'a>(
+    /// Give the session a mutable copy of `schema.table`.
+    ///
+    /// Returns `Ok(Some((schema, canonical table name)))` when the overlay now
+    /// owns the table, and `Ok(None)` when stateful simulation is switched off —
+    /// in that mode every write is answered with a plain OK and nothing is kept.
+    /// The copy is attached once and never re-charged, so an `INSERT` loop cannot
+    /// inflate the byte budget.
+    fn materialise(
         &self,
-        state: &'a mut SessionState,
+        state: &mut SessionState,
         schema: Option<&str>,
         table: &str,
         ctx: &QueryContext,
-    ) -> std::result::Result<&'a mut FakeTable, QueryResult> {
-        if !state.budgets().enabled {
-            return Err(QueryResult::ok(0, 0, ""));
-        }
-        // Locate without holding a borrow so the clone can be attached.
+    ) -> std::result::Result<Option<(String, String)>, QueryResult> {
         let resolved = self
             .resolve(state, schema, table, ctx)
             .map(|(name, view)| (name.to_string(), view.table().clone()));
         let Some((schema_name, base)) = resolved else {
-            let qualifier = schema
-                .map(str::to_string)
-                .or_else(|| Some(ctx.current_db.clone()))
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "mysql".to_string());
-            return Err(QueryResult::error(
-                1146,
-                "42S02",
-                format!("Table '{qualifier}.{table}' doesn't exist"),
-            ));
+            return Err(unknown_table(schema, table, ctx));
         };
-        if state.owned_table(&schema_name, &base.name).is_none()
-            && let Err(err) = state.attach(&schema_name, &base)
-        {
-            return Err(state_error_result(err));
+        match state.attach(&schema_name, &base) {
+            Ok(()) => Ok(Some((schema_name, base.name))),
+            Err(StateError::Disabled) => Ok(None),
+            Err(err) => Err(state_error_result(err)),
         }
-        let Some(owned) = state.owned_table_mut(&schema_name, &base.name) else {
-            return Err(QueryResult::error(
-                1146,
-                "42S02",
-                format!(
-                    "Table '{}' doesn't exist",
-                    util::clip(&format!("{schema_name}.{}", base.name), 128)
-                ),
-            ));
-        };
-        Ok(owned)
     }
 
     fn insert(
@@ -1388,7 +1438,7 @@ impl FakeDatabase {
         state: &mut SessionState,
         replace: bool,
     ) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let mut cursor = 0usize;
@@ -1541,7 +1591,7 @@ impl FakeDatabase {
     }
 
     fn update(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let mut cursor = 0usize;
@@ -1613,24 +1663,21 @@ impl FakeDatabase {
         }
 
         let clauses = parse_clauses(&tokens, &mut end);
-        let limit = clauses.limit.map(|limit| limit.count as usize);
+        if !clauses.group_by.is_empty() {
+            return unsupported_clause("group by on update");
+        }
         let where_expr = match &clauses.where_expr {
             ClauseState::Missing => None,
             ClauseState::Parsed(expression) => Some(expression.clone()),
-            ClauseState::Unsupported => {
-                return QueryResult::ResultSet(ResultSet {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    degraded: true,
-                });
-            }
+            // A zero-column result set is not a legal DML answer: drivers and
+            // ORMs read it as a truncated result set and lose the stream.
+            ClauseState::Unsupported => return unsupported_clause("this WHERE clause"),
         };
 
         // Evaluate the predicate and the new values against the *original* rows,
         // so a column can reference its own previous value inside one statement.
         let eval_ctx = ctx.eval_context();
-        let mut matched = 0u64;
-        let mut planned: Vec<PendingUpdate> = Vec::new();
+        let mut selected: Vec<usize> = Vec::new();
         for (index, row) in table_columns.rows.iter().enumerate() {
             let active = match &where_expr {
                 None => true,
@@ -1654,13 +1701,33 @@ impl FakeDatabase {
                     }
                 }
             };
-            if !active {
-                continue;
+            if active {
+                selected.push(index);
             }
-            if limit.is_some_and(|limit| matched as usize >= limit) {
-                break;
-            }
-            matched += 1;
+        }
+        // `UPDATE ... ORDER BY ... LIMIT` touches rows in sorted order, not in
+        // storage order. Ignoring the sort while reporting success would update
+        // the wrong rows silently.
+        if let Err(result) = sort_rows_by_order(
+            self,
+            &table_columns,
+            &mut selected,
+            &clauses.order_by,
+            &eval_ctx,
+            state,
+        ) {
+            return result;
+        }
+        if let Some(limit) = clauses.limit {
+            let count = usize::try_from(limit.count).unwrap_or(usize::MAX);
+            let offset = usize::try_from(limit.offset).unwrap_or(usize::MAX);
+            selected = selected.into_iter().skip(offset).take(count).collect();
+        }
+        let matched = selected.len();
+
+        let mut planned: Vec<self::state::PendingRowUpdate> = Vec::with_capacity(selected.len());
+        for index in selected {
+            let row = &table_columns.rows[index];
             let context = RowContext {
                 columns: &table_columns.columns,
                 row,
@@ -1684,57 +1751,31 @@ impl FakeDatabase {
             planned.push((index, changes));
         }
 
-        if let Err(early) = self.writable_table(state, schema_name.as_deref(), &table_name, ctx) {
-            return early;
-        }
-        let mut changed = 0u64;
-        if let Some(table) = state.owned_table_mut(
-            &self
-                .resolve_schema_name(state, schema_name.as_deref(), &table_name, ctx)
-                .unwrap_or_else(|| ctx.current_db.clone()),
-            &table_columns.name,
-        ) {
-            for (index, changes) in planned {
-                let Some(row) = table.rows.get_mut(index) else {
-                    continue;
-                };
-                let mut touched = false;
-                for (position, value) in changes {
-                    if position >= row.len() {
-                        continue;
-                    }
-                    if row[position] != value {
-                        touched = true;
-                    }
-                    row[position] = value;
-                }
-                if touched {
-                    changed += 1;
-                }
-            }
-        }
-        state.set_row_count(changed as i64);
+        let owned = match self.materialise(state, schema_name.as_deref(), &table_name, ctx) {
+            Ok(owned) => owned,
+            Err(result) => return result,
+        };
+        let Some((schema, canonical)) = owned else {
+            // Simulation is off: acknowledge without touching anything.
+            return QueryResult::ok(0, 0, "");
+        };
+        let outcome = match state.update_rows(&schema, &canonical, &planned) {
+            Ok(outcome) => outcome,
+            Err(err) => return state_error_result(err),
+        };
+        state.set_row_count(outcome.changed as i64);
         QueryResult::ok(
-            changed,
+            outcome.changed as u64,
             0,
-            &format!("Rows matched: {matched}  Changed: {changed}  Warnings: 0"),
+            &format!(
+                "Rows matched: {matched}  Changed: {}  Warnings: 0",
+                outcome.changed
+            ),
         )
     }
 
-    /// Schema name a table resolves to, for overlay bookkeeping.
-    fn resolve_schema_name(
-        &self,
-        state: &SessionState,
-        schema: Option<&str>,
-        table: &str,
-        ctx: &QueryContext,
-    ) -> Option<String> {
-        self.resolve(state, schema, table, ctx)
-            .map(|(name, _)| name.to_string())
-    }
-
     fn delete(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let mut cursor = 0usize;
@@ -1753,21 +1794,17 @@ impl FakeDatabase {
             return unknown_table(schema_name.as_deref(), &table_name, ctx);
         };
         let clauses = parse_clauses(&tokens, &mut cursor);
-        let limit = clauses.limit.map(|limit| limit.count as usize);
+        if !clauses.group_by.is_empty() {
+            return unsupported_clause("group by on delete");
+        }
         let where_expr = match &clauses.where_expr {
             ClauseState::Missing => None,
             ClauseState::Parsed(expression) => Some(expression.clone()),
-            ClauseState::Unsupported => {
-                return QueryResult::ResultSet(ResultSet {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    degraded: true,
-                });
-            }
+            ClauseState::Unsupported => return unsupported_clause("this WHERE clause"),
         };
         let eval_ctx = ctx.eval_context();
-        let mut matches = Vec::with_capacity(table_columns.rows.len());
-        for row in &table_columns.rows {
+        let mut selected: Vec<usize> = Vec::with_capacity(table_columns.rows.len());
+        for (index, row) in table_columns.rows.iter().enumerate() {
             let matched = match &where_expr {
                 None => true,
                 Some(expression) => {
@@ -1790,25 +1827,40 @@ impl FakeDatabase {
                     }
                 }
             };
-            matches.push(matched);
+            if matched {
+                selected.push(index);
+            }
         }
-        let Ok(table) = self.writable_table(state, schema_name.as_deref(), &table_name, ctx) else {
+        // `DELETE ... ORDER BY ... LIMIT` removes the lowest/highest keys first.
+        if let Err(result) = sort_rows_by_order(
+            self,
+            &table_columns,
+            &mut selected,
+            &clauses.order_by,
+            &eval_ctx,
+            state,
+        ) {
+            return result;
+        }
+        if let Some(limit) = clauses.limit {
+            let count = usize::try_from(limit.count).unwrap_or(usize::MAX);
+            let offset = usize::try_from(limit.offset).unwrap_or(usize::MAX);
+            selected = selected.into_iter().skip(offset).take(count).collect();
+        }
+
+        let owned = match self.materialise(state, schema_name.as_deref(), &table_name, ctx) {
+            Ok(owned) => owned,
+            Err(result) => return result,
+        };
+        let Some((schema, canonical)) = owned else {
             return QueryResult::ok(0, 0, "");
         };
-        let mut removed = 0u64;
-        let mut index = 0usize;
-        table.rows.retain(|_| {
-            let matched = matches.get(index).copied().unwrap_or(false);
-            index += 1;
-            if matched && limit.is_none_or(|limit| (removed as usize) < limit) {
-                removed += 1;
-                false
-            } else {
-                true
-            }
-        });
+        let removed = match state.delete_rows(&schema, &canonical, &selected) {
+            Ok(removed) => removed,
+            Err(err) => return state_error_result(err),
+        };
         state.set_row_count(removed as i64);
-        QueryResult::ok(removed, 0, "")
+        QueryResult::ok(removed as u64, 0, "")
     }
 
     fn truncate(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
@@ -1819,12 +1871,26 @@ impl FakeDatabase {
             }
         }
         let table_name = unquote_ident(rest);
-        let Ok(table) = self.writable_table(state, None, &table_name, ctx) else {
+        if table_name.is_empty() {
+            return QueryResult::syntax_error(rest);
+        }
+        if self.peek_table(state, None, &table_name, ctx).is_none() {
             return unknown_table(None, &table_name, ctx);
+        }
+        let owned = match self.materialise(state, None, &table_name, ctx) {
+            Ok(owned) => owned,
+            Err(result) => return result,
         };
-        table.rows.clear();
-        state.set_row_count(0);
-        QueryResult::ok(0, 0, "")
+        let Some((schema, canonical)) = owned else {
+            return QueryResult::ok(0, 0, "");
+        };
+        match state.truncate_table(&schema, &canonical) {
+            Ok(_) => {
+                state.set_row_count(0);
+                QueryResult::ok(0, 0, "")
+            }
+            Err(err) => state_error_result(err),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1832,7 +1898,7 @@ impl FakeDatabase {
     // -----------------------------------------------------------------------
 
     fn create(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let mut cursor = 0usize;
@@ -2036,7 +2102,7 @@ impl FakeDatabase {
     }
 
     fn drop(&self, rest: &str, ctx: &QueryContext, state: &mut SessionState) -> QueryResult {
-        let Some(tokens) = sql::tokenize(rest) else {
+        let Some(tokens) = self.tokens(rest, ctx) else {
             return QueryResult::syntax_error(rest);
         };
         let mut cursor = 0usize;
@@ -2061,7 +2127,12 @@ impl FakeDatabase {
                     ),
                 );
             }
-            state.drop_schema(&name);
+            // Only a schema that exists in the base catalog needs a tombstone;
+            // a session-created one is simply removed from the overlay.
+            let base_schema = self.base_has_schema(&name);
+            if let Err(err) = state.drop_schema(&name, base_schema) {
+                return state_error_result(err);
+            }
             return QueryResult::ok(1, 0, "");
         }
         if !skip_keyword(&tokens, &mut cursor, "TABLE") {
@@ -2086,7 +2157,14 @@ impl FakeDatabase {
                     .resolve(state, schema_name.as_deref(), &table_name, ctx)
                     .map(|(name, _)| name.to_string())
                     .unwrap_or_else(|| ctx.current_db.clone());
-                state.drop_table(&canonical, &table_name);
+                // A tombstone is only needed for a table the base catalog still
+                // holds; dropping a session-created table is pure bookkeeping and
+                // must not leave a marker behind, or a CREATE/DROP loop over ever
+                // new names would grow the overlay without bound.
+                let base_table = self.base_has_table(&canonical, &table_name);
+                if let Err(err) = state.drop_table(&canonical, &table_name, base_table) {
+                    return state_error_result(err);
+                }
                 dropped += 1;
             }
             if !matches!(tokens.get(cursor), Some(Token::Sym(Sym::Comma))) {
@@ -2502,7 +2580,7 @@ fn render_tokens(tokens: &[Token]) -> String {
                 out.push_str("@@");
                 out.push_str(name);
             }
-            Token::Placeholder => out.push('?'),
+            Token::Placeholder(_) => out.push('?'),
             Token::Sym(symbol) => out.push_str(match symbol {
                 Sym::LParen => "(",
                 Sym::RParen => ")",
@@ -2630,51 +2708,19 @@ fn execute_select(
         ));
     }
 
-    // ORDER BY before pagination, exactly like MySQL.
-    if !clauses.order_by.is_empty() {
-        let mut keyed: Vec<(usize, Vec<Value>)> = Vec::with_capacity(selected.len());
-        for index in &selected {
-            let row = &table.rows[*index];
-            let raw = row.clone();
-            let context = RowContext {
-                columns: &table.columns,
-                row: &raw,
-                session: &eval_ctx,
-                state,
-                variables: &database.variables,
-            };
-            let mut keys = Vec::with_capacity(clauses.order_by.len());
-            for (expression, _) in &clauses.order_by {
-                match eval::evaluate(expression, &context) {
-                    Ok(value) => keys.push(value),
-                    Err(err) => {
-                        return QueryResult::error(
-                            err.code(),
-                            err.sqlstate(),
-                            err.message("order clause"),
-                        );
-                    }
-                }
-            }
-            keyed.push((*index, keys));
-        }
-        keyed.sort_by(|left, right| {
-            for (position, (_, ascending)) in clauses.order_by.iter().enumerate() {
-                let ordering = eval::compare_values(&left.1[position], &right.1[position], true);
-                match ordering {
-                    Some(std::cmp::Ordering::Equal) | None => continue,
-                    Some(ordering) => {
-                        return if *ascending {
-                            ordering
-                        } else {
-                            ordering.reverse()
-                        };
-                    }
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-        selected = keyed.into_iter().map(|(index, _)| index).collect();
+    // ORDER BY before pagination, exactly like MySQL. The comparison is type
+    // aware: sorting a `varchar` column by its declared type is what makes
+    // `ORDER BY username` a dictionary order instead of collapsing every
+    // non-numeric string to zero.
+    if let Err(result) = sort_rows_by_order(
+        database,
+        table,
+        &mut selected,
+        &clauses.order_by,
+        &eval_ctx,
+        state,
+    ) {
+        return result;
     }
 
     let offset = clauses.limit.map_or(0, |limit| limit.offset);
@@ -2747,8 +2793,16 @@ fn aggregate_select(
         rows: Vec::new(),
         degraded: false,
     };
-    // Group the selected rows by the evaluated GROUP BY key.
-    let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    // Group the selected rows by the evaluated GROUP BY key. Grouping uses the
+    // same type-aware collation as `ORDER BY`, so `GROUP BY username` folds
+    // `Admin` and `admin` together under the advertised `ai_ci` collation
+    // instead of treating every non-numeric string as `0`.
+    let group_numeric: Vec<bool> = clauses
+        .group_by
+        .iter()
+        .map(|expression| eval::sort_is_numeric(expression, &table.columns))
+        .collect();
+    let mut groups: Vec<(Vec<eval::SortKey>, Vec<usize>)> = Vec::new();
     if clauses.group_by.is_empty() {
         groups.push((Vec::new(), selected.to_vec()));
     } else {
@@ -2763,9 +2817,11 @@ fn aggregate_select(
             };
             let mut key = Vec::with_capacity(clauses.group_by.len());
             let mut failed = false;
-            for expression in &clauses.group_by {
+            for (position, expression) in clauses.group_by.iter().enumerate() {
                 match eval::evaluate(expression, &context) {
-                    Ok(value) => key.push(value),
+                    Ok(value) => {
+                        key.push(eval::SortKey::new(&value, group_numeric[position]));
+                    }
                     Err(_) => {
                         failed = true;
                         break;
@@ -2776,7 +2832,10 @@ fn aggregate_select(
                 result.degraded = true;
                 return result;
             }
-            match groups.iter_mut().find(|(existing, _)| *existing == key) {
+            match groups
+                .iter_mut()
+                .find(|(existing, _)| group_keys_match(existing, &key))
+            {
                 Some((_, rows)) => rows.push(*index),
                 None => {
                     if groups.len() < MAX_RESULT_ROWS {
@@ -2786,12 +2845,15 @@ fn aggregate_select(
             }
         }
     }
+    // MySQL emits grouped output in ascending group-key order.
     groups.sort_by(|left, right| {
         for (position, value) in left.0.iter().enumerate() {
-            let ordering = eval::compare_values(value, &right.0[position], true);
-            match ordering {
-                Some(std::cmp::Ordering::Equal) | None => continue,
-                Some(ordering) => return ordering,
+            let Some(other) = right.0.get(position) else {
+                continue;
+            };
+            let ordering = value.cmp(other);
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
             }
         }
         std::cmp::Ordering::Equal
@@ -2829,18 +2891,26 @@ fn aggregate_select(
                     argument,
                     distinct,
                     ..
-                } => fold_aggregate(
-                    database,
-                    table,
-                    *kind,
-                    argument.as_ref(),
-                    *distinct,
-                    rows,
-                    eval_ctx,
-                    state,
-                )
-                .map(|value| value.to_wire())
-                .unwrap_or(None),
+                } => {
+                    // `MIN`/`MAX` follow the declared type of their argument, so
+                    // `MIN(username)` is a dictionary minimum instead of `0`.
+                    let numeric = argument
+                        .as_ref()
+                        .is_none_or(|arg| eval::sort_is_numeric(arg, &table.columns));
+                    fold_aggregate(
+                        database,
+                        table,
+                        *kind,
+                        argument.as_ref(),
+                        *distinct,
+                        numeric,
+                        rows,
+                        eval_ctx,
+                        state,
+                    )
+                    .map(|value| value.to_wire())
+                    .unwrap_or(None)
+                }
             };
             cost += value.as_ref().map_or(0, String::len) + 1;
             values.push(value);
@@ -2861,6 +2931,7 @@ fn fold_aggregate(
     kind: AggregateKind,
     argument: Option<&Expr>,
     distinct: bool,
+    numeric: bool,
     rows: &[usize],
     eval_ctx: &EvalContext,
     state: &SessionState,
@@ -2902,24 +2973,25 @@ fn fold_aggregate(
                 .count() as i64
         })),
         AggregateKind::Min | AggregateKind::Max => {
-            let mut best: Option<Value> = None;
+            let mut best: Option<(eval::SortKey, Value)> = None;
             for value in values {
                 if matches!(value, Value::Null) {
                     continue;
                 }
+                let key = eval::SortKey::new(&value, numeric);
                 best = Some(match best {
-                    None => value,
-                    Some(current) => {
-                        let ordering = eval::compare_values(&value, &current, true);
+                    None => (key, value),
+                    Some((current_key, current)) => {
+                        let ordering = key.cmp(&current_key);
                         match (kind, ordering) {
-                            (AggregateKind::Min, Some(std::cmp::Ordering::Less)) => value,
-                            (AggregateKind::Max, Some(std::cmp::Ordering::Greater)) => value,
-                            _ => current,
+                            (AggregateKind::Min, std::cmp::Ordering::Less)
+                            | (AggregateKind::Max, std::cmp::Ordering::Greater) => (key, value),
+                            _ => (current_key, current),
                         }
                     }
                 });
             }
-            Some(best.unwrap_or(Value::Null))
+            Some(best.map_or(Value::Null, |(_, value)| value))
         }
         AggregateKind::Sum | AggregateKind::Avg => {
             let numbers: Vec<f64> = values.iter().filter_map(Value::as_f64).collect();
@@ -3023,12 +3095,18 @@ fn materialise_expressions(
                 distinct,
                 label,
             } => {
+                // Against the empty table a `MIN`/`MAX` has no key to compare, so
+                // the numeric flag only has to be well defined, not meaningful.
+                let numeric = argument
+                    .as_ref()
+                    .is_none_or(|arg| eval::sort_is_numeric(arg, &[]));
                 let value = fold_aggregate(
                     database,
                     &EMPTY_TABLE.with(|table| table.clone()),
                     *kind,
                     argument.as_ref(),
                     *distinct,
+                    numeric,
                     &(0..row_count).collect::<Vec<_>>(),
                     &eval_ctx,
                     state,
@@ -3217,6 +3295,101 @@ fn state_error_result(err: StateError) -> QueryResult {
     QueryResult::error(err.code(), err.sqlstate(), err.message())
 }
 
+/// `ER_NOT_SUPPORTED_YET` for a clause the virtual engine cannot model.
+///
+/// A zero-column result set is never a legal answer to a DML statement: a driver
+/// or ORM reads it as a result set with no columns and then mis-frames the rest
+/// of the packet stream. Reporting the MySQL error is both honest and
+/// protocol-safe.
+fn unsupported_clause(feature: &str) -> QueryResult {
+    QueryResult::error(
+        1235,
+        "42000",
+        format!(
+            "This version of MySQL doesn't yet support '{}'",
+            util::clip(feature, 128)
+        ),
+    )
+}
+
+/// Sort `indices` the way `ORDER BY` prescribes.
+///
+/// The comparison is type aware: a numeric column sorts by value, a text column
+/// by the advertised case-insensitive collation, and `NULL` sorts before every
+/// other value. Keys are materialised once per row so the comparator itself does
+/// no allocation and is a genuine total order — `slice::sort_by` is allowed to
+/// panic on a comparator that is not.
+fn sort_rows_by_order(
+    database: &FakeDatabase,
+    table: &FakeTable,
+    indices: &mut Vec<usize>,
+    order_by: &[(Expr, bool)],
+    eval_ctx: &EvalContext,
+    state: &SessionState,
+) -> std::result::Result<(), QueryResult> {
+    if order_by.is_empty() || indices.len() < 2 {
+        return Ok(());
+    }
+    let numeric: Vec<bool> = order_by
+        .iter()
+        .map(|(expression, _)| eval::sort_is_numeric(expression, &table.columns))
+        .collect();
+    let mut keyed: Vec<(usize, Vec<eval::SortKey>)> = Vec::with_capacity(indices.len());
+    for index in indices.iter().copied() {
+        let Some(row) = table.rows.get(index) else {
+            continue;
+        };
+        let context = RowContext {
+            columns: &table.columns,
+            row,
+            session: eval_ctx,
+            state,
+            variables: &database.variables,
+        };
+        let mut keys = Vec::with_capacity(order_by.len());
+        for (position, (expression, _)) in order_by.iter().enumerate() {
+            match eval::evaluate(expression, &context) {
+                Ok(value) => keys.push(eval::SortKey::new(&value, numeric[position])),
+                Err(err) => {
+                    return Err(QueryResult::error(
+                        err.code(),
+                        err.sqlstate(),
+                        err.message("order clause"),
+                    ));
+                }
+            }
+        }
+        keyed.push((index, keys));
+    }
+    keyed.sort_by(|left, right| {
+        for (position, (_, ascending)) in order_by.iter().enumerate() {
+            let (Some(a), Some(b)) = (left.1.get(position), right.1.get(position)) else {
+                continue;
+            };
+            let ordering = a.cmp(b);
+            if ordering != std::cmp::Ordering::Equal {
+                return if *ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    *indices = keyed.into_iter().map(|(index, _)| index).collect();
+    Ok(())
+}
+
+/// Whether two group keys describe the same group.
+fn group_keys_match(left: &[eval::SortKey], right: &[eval::SortKey]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.cmp(b) == std::cmp::Ordering::Equal)
+}
+
 fn split_value_end(tokens: &[Token]) -> usize {
     let mut depth = 0i32;
     for (index, token) in tokens.iter().enumerate() {
@@ -3259,9 +3432,6 @@ fn literal_from_tokens(
 
 /// One row of an `INSERT`: the optional column list plus the values.
 type InsertRow = (Option<Vec<String>>, Vec<Option<String>>);
-
-/// One row an `UPDATE` will touch: its index plus `(column, new value)` pairs.
-type PendingUpdate = (usize, Vec<(usize, Option<String>)>);
 
 #[allow(clippy::too_many_arguments)]
 fn apply_insert(
@@ -3332,59 +3502,81 @@ fn apply_insert(
         prepared.push(row);
     }
 
-    // Materialise the session's copy of the table first: `push_row` needs it to
-    // exist in the overlay.
-    if let Err(early) = database.writable_table(state, schema, table_name, ctx) {
-        return early;
-    }
+    // Materialise the session's copy of the table first: the state layer only
+    // mutates tables the overlay owns.
+    let owned = match database.materialise(state, schema, table_name, ctx) {
+        Ok(owned) => owned,
+        Err(result) => return result,
+    };
+    let Some((schema_name, canonical)) = owned else {
+        // Simulation is off: acknowledge the statement without keeping anything.
+        let inserted = prepared.len() as u64;
+        return QueryResult::ok(inserted, 0, "");
+    };
     let auto_index = definition.auto_increment_column();
-    let schema_name = schema
-        .map(str::to_string)
-        .or_else(|| Some(ctx.current_db.clone()))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "app_prod".to_string());
-    let mut inserted = 0u64;
-    let mut last_id = first_generated;
-    for row in prepared {
-        // `REPLACE` deletes the conflicting row first; the primary key is the
-        // only unique constraint modelled.
-        if replace
-            && let Some(index) = auto_index
-            && let Some(value) = row.get(index).cloned().flatten()
-            && let Ok(table) = database.writable_table(state, schema, table_name, ctx)
-            && let Some(position) = table.rows.iter().position(|existing| {
-                existing.get(index).cloned().flatten().as_deref() == Some(value.as_str())
-            })
-        {
-            table.rows.remove(position);
-        }
-        match state.push_row(&schema_name, table_name, row) {
-            Ok(_) => {
-                inserted += 1;
-                if let Some(index) = auto_index
-                    && let Some(value) = state
-                        .owned_table(&schema_name, table_name)
-                        .and_then(|table| table.rows.last())
-                        .and_then(|row| row.get(index))
-                        .and_then(|cell| cell.as_deref())
-                        .and_then(|text| text.parse::<u64>().ok())
-                {
-                    last_id = value;
-                }
-            }
-            Err(err) if ignore => {
-                let _ = err;
-            }
+    // The key each row will be stored under, used for `LAST_INSERT_ID()`.
+    let keys: Vec<Option<u64>> = prepared
+        .iter()
+        .map(|row| auto_key(row, auto_index))
+        .collect();
+    let reported_id = if first_generated > 0 {
+        first_generated
+    } else {
+        keys.iter().rev().find_map(|key| *key).unwrap_or(0)
+    };
+
+    // `REPLACE` reports the rows it deleted plus the rows it inserted, which is
+    // what MySQL does; a plain `INSERT` reports what it stored.
+    let (affected, info) = if replace {
+        // `REPLACE` deletes the conflicting rows and inserts the batch as one
+        // unit: a refused batch must not leave the old rows deleted.
+        match state.replace_rows(&schema_name, &canonical, auto_index, prepared) {
+            Ok(outcome) => (
+                (outcome.removed + outcome.inserted) as u64,
+                format!(
+                    "Records: {}  Duplicates: {}  Warnings: 0",
+                    outcome.inserted, outcome.removed
+                ),
+            ),
             Err(err) => return state_error_result(err),
         }
-    }
-    state.set_row_count(inserted as i64);
-    state.set_last_insert_id(last_id);
-    QueryResult::ok(
-        inserted,
-        last_id,
-        &format!("({inserted} row{})", if inserted == 1 { "" } else { "s" }),
-    )
+    } else if ignore {
+        // `INSERT IGNORE` is partial *by definition*: the offending rows are
+        // skipped and the rest are stored, which is exactly what a per-row
+        // commit produces. The reported count matches what was really stored.
+        let mut stored = 0u64;
+        for row in prepared {
+            match state.insert_rows(&schema_name, &canonical, vec![row]) {
+                Ok(_) => stored += 1,
+                Err(_) => continue,
+            }
+        }
+        (stored, record_info(stored))
+    } else {
+        // A plain multi-row `INSERT` is atomic: every row is validated before
+        // the first one is stored, so the client never sees a partial write
+        // together with an error.
+        match state.insert_rows(&schema_name, &canonical, prepared) {
+            Ok(count) => (count as u64, record_info(count as u64)),
+            Err(err) => return state_error_result(err),
+        }
+    };
+    state.set_row_count(affected as i64);
+    state.set_last_insert_id(reported_id);
+    QueryResult::ok(affected, reported_id, &info)
+}
+
+/// The `info` string MySQL sends for an `INSERT`.
+fn record_info(rows: u64) -> String {
+    format!("({rows} row{})", if rows == 1 { "" } else { "s" })
+}
+
+/// The auto-increment value a prepared row will be stored under.
+fn auto_key(row: &[Option<String>], index: Option<usize>) -> Option<u64> {
+    let index = index?;
+    row.get(index)
+        .and_then(|cell| cell.as_deref())
+        .and_then(|text| text.trim().parse::<u64>().ok())
 }
 
 /// Replace control characters so a hostile statement cannot forge log lines.
@@ -3594,13 +3786,13 @@ mod tests {
     use super::*;
 
     fn ctx() -> QueryContext {
-        QueryContext {
-            current_db: "app_prod".to_string(),
-            username: "root".to_string(),
-            client_host: "203.0.113.9".to_string(),
-            connection_id: 42,
-            server_version: "8.0.36".to_string(),
-        }
+        QueryContext::new(
+            "app_prod".to_string(),
+            "root".to_string(),
+            "203.0.113.9".to_string(),
+            42,
+            "8.0.36".to_string(),
+        )
     }
 
     fn database() -> FakeDatabase {
@@ -4340,6 +4532,88 @@ mod tests {
     }
 
     #[test]
+    fn hostile_expressions_never_trap_the_evaluator() {
+        // The release profile is `panic = "abort"`, so any of these reaching a
+        // panic would end the process for every connection at once. Each entry is
+        // a shape that has historically trapped a hand-written evaluator:
+        // saturating casts, byte slicing and arithmetic overflow.
+        let database = database();
+        let context = ctx();
+        let mut state = SessionState::default();
+        let hostile = [
+            "SELECT SUBSTRING('abcdef', 1, 1e300)",
+            "SELECT SUBSTRING('abcdef', -1e300, 1e300)",
+            "SELECT SUBSTRING('äöü', 2, 1e300)",
+            "SELECT LEFT('abc', 1e300)",
+            "SELECT RIGHT('abc', 1e300)",
+            "SELECT ROUND(1e308, -30)",
+            "SELECT ROUND(-1e308, -30)",
+            "SELECT ROUND(1e308, 30)",
+            "SELECT REPEAT('x', 1e18)",
+            "SELECT REPEAT('', 0)",
+            "SELECT POW(1e308, 1e308)",
+            "SELECT MOD(1, 0)",
+            "SELECT 1/0",
+            "SELECT 9223372036854775807 * 9223372036854775807",
+            "SELECT -9223372036854775808 / -1",
+            "SELECT CONCAT('a', REPEAT('b', 1024), REPEAT('c', 1024))",
+            "SELECT HEX(REPEAT('x', 1024))",
+            "SELECT UNHEX('zz')",
+            "SELECT CAST(1e309 AS SIGNED)",
+            "SELECT CURDATE(), CURTIME(), NOW()",
+            "SELECT * FROM app_prod.users ORDER BY SUBSTRING(username, 1, 1e300)",
+            "SELECT * FROM app_prod.users ORDER BY ROUND(id, -1e9)",
+            "SELECT * FROM app_prod.users WHERE SUBSTRING(username, 1, 1e300) = 'a'",
+            "SELECT * FROM app_prod.users WHERE username LIKE '%%a%%a%%a%%a%%b'",
+            "SELECT MIN(username), MAX(username), SUM(id), AVG(id) FROM app_prod.users",
+            "SELECT * FROM app_prod.users GROUP BY SUBSTRING(username, 1, 1e300)",
+            "SELECT * FROM app_prod.users LIMIT 18446744073709551615 OFFSET 18446744073709551615",
+            "SELECT * FROM app_prod.users LIMIT 0.5",
+            "SELECT `\u{1F600}`, '\u{1F600}'",
+            "SELECT * FROM app_prod.users WHERE username = '\u{1F600}'",
+            "SELECT '\u{0000}\u{0001}\u{001b}[31m'",
+        ];
+        for sql in hostile {
+            // Any answer is acceptable; not returning is not.
+            let _ = database.dispatch(sql, &context, &mut state);
+        }
+        // The session is still coherent after all of that.
+        let (rows, bytes) = state.recount();
+        assert_eq!(state.rows(), rows);
+        assert_eq!(state.bytes(), bytes);
+    }
+
+    #[test]
+    fn hostile_ddl_never_grows_the_session_without_bound() {
+        let database = database();
+        let context = ctx();
+        let mut state = SessionState::default();
+        // A thousand unusable DDL statements, then a check that the overlay is
+        // still empty and the error paths did not leak bookkeeping.
+        for round in 0..1_000u32 {
+            let statements: Vec<String> = vec![
+                "CREATE TABLE app_prod.users (id bigint)".to_string(),
+                format!("DROP TABLE app_prod.nope{round}"),
+                format!("CREATE TABLE app_prod.x{round} (id bigint, id bigint)"),
+                format!("DROP DATABASE app_prod{round}"),
+                "CREATE TABLE app_prod (id bigint)".to_string(),
+                "DROP TABLE app_prod.users, app_prod.users, app_prod.users".to_string(),
+            ];
+            for sql in statements {
+                let _ = database.dispatch(&sql, &context, &mut state);
+            }
+        }
+        let (rows, bytes) = state.recount();
+        assert_eq!(state.rows(), rows);
+        assert_eq!(state.bytes(), bytes);
+        assert!(
+            state.tombstones() <= 64,
+            "tombstones are unbounded: {}",
+            state.tombstones()
+        );
+    }
+
+    #[test]
     fn deeply_nested_where_does_not_blow_the_stack() {
         let deep = format!(
             "SELECT * FROM users WHERE {}id = 1{}",
@@ -4406,5 +4680,495 @@ mod tests {
         let mut context = ctx();
         context.current_db = name.to_string();
         context
+    }
+
+    // -- ORDER BY and GROUP BY correctness ----------------------------------
+
+    #[test]
+    fn string_columns_sort_dictionary_wise() {
+        // The regression this guards: a hard-coded numeric comparison made every
+        // non-numeric string read as 0, so all of them compared equal and the
+        // order collapsed to storage order.
+        let ascending: Vec<String> =
+            rows_of("SELECT username FROM app_prod.users ORDER BY username ASC")
+                .into_iter()
+                .map(|row| row[0].clone().unwrap_or_default())
+                .collect();
+        assert_eq!(ascending, vec!["admin", "alice", "bob"]);
+
+        let descending: Vec<String> =
+            rows_of("SELECT username FROM app_prod.users ORDER BY username DESC")
+                .into_iter()
+                .map(|row| row[0].clone().unwrap_or_default())
+                .collect();
+        assert_eq!(descending, vec!["bob", "alice", "admin"]);
+    }
+
+    #[test]
+    fn a_string_limit_takes_the_first_or_last_in_dictionary_order() {
+        assert_eq!(
+            single_value("SELECT username FROM app_prod.users ORDER BY username ASC LIMIT 1")
+                .as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            single_value("SELECT username FROM app_prod.users ORDER BY username DESC LIMIT 1")
+                .as_deref(),
+            Some("bob")
+        );
+        // The documented example shape: `ORDER BY id DESC` starts at the highest
+        // key, and `LIMIT 1` narrows it to one row.
+        assert_eq!(
+            single_value("SELECT id FROM app_prod.users ORDER BY id DESC LIMIT 1").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn numeric_columns_sort_by_value_not_by_text() {
+        let database = database();
+        let mut state = SessionState::default();
+        assert!(matches!(
+            database.dispatch("CREATE TABLE app_prod.n (id bigint)", &ctx(), &mut state),
+            QueryResult::Ok { .. }
+        ));
+        for value in ["9", "10", "100", "2"] {
+            match database.dispatch(
+                &format!("INSERT INTO app_prod.n (id) VALUES ({value})"),
+                &ctx(),
+                &mut state,
+            ) {
+                QueryResult::Ok { .. } => {}
+                other => panic!("insert {value} -> {other:?}"),
+            }
+        }
+        let values: Vec<String> = match database.dispatch(
+            "SELECT id FROM app_prod.n ORDER BY id ASC",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set
+                .rows
+                .iter()
+                .map(|row| row[0].clone().unwrap_or_default())
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            values,
+            vec!["2", "9", "10", "100"],
+            "text order would put 10 before 9"
+        );
+    }
+
+    #[test]
+    fn null_sorts_first_ascending_and_last_descending() {
+        let database = database();
+        let mut state = SessionState::default();
+        match database.dispatch(
+            "UPDATE app_prod.users SET username = NULL WHERE id = 2",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Ok { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let ascending: Vec<Option<String>> = match database.dispatch(
+            "SELECT username FROM app_prod.users ORDER BY username ASC",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set.rows.iter().map(|row| row[0].clone()).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            ascending,
+            vec![None, Some("admin".to_string()), Some("bob".to_string())]
+        );
+
+        let descending: Vec<Option<String>> = match database.dispatch(
+            "SELECT username FROM app_prod.users ORDER BY username DESC",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set.rows.iter().map(|row| row[0].clone()).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            descending,
+            vec![Some("bob".to_string()), Some("admin".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn multi_column_order_by_respects_precedence() {
+        let rows =
+            rows_of("SELECT role, username FROM app_prod.users ORDER BY role ASC, username DESC");
+        assert_eq!(rows.len(), 3);
+        // `administrator` sorts before `user`, and within `user` bob precedes alice.
+        assert_eq!(rows[0][1].as_deref(), Some("admin"));
+        assert_eq!(rows[1][1].as_deref(), Some("bob"));
+        assert_eq!(rows[2][1].as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn group_by_and_aggregates_agree_with_the_column_types() {
+        let rows = rows_of("SELECT role, COUNT(*) FROM app_prod.users GROUP BY role ORDER BY role");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("administrator"));
+        assert_eq!(rows[0][1].as_deref(), Some("1"));
+        assert_eq!(rows[1][0].as_deref(), Some("user"));
+        assert_eq!(rows[1][1].as_deref(), Some("2"));
+
+        // MIN/MAX follow the declared type of their argument.
+        assert_eq!(
+            single_value("SELECT MIN(username) FROM app_prod.users").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            single_value("SELECT MAX(username) FROM app_prod.users").as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            single_value("SELECT MIN(id) FROM app_prod.users").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            single_value("SELECT MAX(id) FROM app_prod.users").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn group_by_folds_case_under_the_advertised_collation() {
+        let database = database();
+        let mut state = SessionState::default();
+        for sql in [
+            "CREATE TABLE app_prod.t (name varchar(32))",
+            "INSERT INTO app_prod.t (name) VALUES ('Admin')",
+            "INSERT INTO app_prod.t (name) VALUES ('admin')",
+            "INSERT INTO app_prod.t (name) VALUES ('Admin')",
+        ] {
+            match database.dispatch(sql, &ctx(), &mut state) {
+                QueryResult::Ok { .. } => {}
+                other => panic!("{sql} -> {other:?}"),
+            }
+        }
+        let rows = match database.dispatch(
+            "SELECT name, COUNT(*) FROM app_prod.t GROUP BY name",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "ai_ci must fold Admin and admin together");
+        assert_eq!(rows[0][1].as_deref(), Some("3"));
+    }
+
+    // -- DML response contract ----------------------------------------------
+
+    #[test]
+    fn dml_with_an_unsupported_where_returns_an_error_not_an_empty_result_set() {
+        let database = database();
+        let mut state = SessionState::default();
+        for sql in [
+            "UPDATE app_prod.users SET role = 'x' WHERE id BETWEEN 1 AND 2",
+            "DELETE FROM app_prod.users WHERE id = (SELECT 1)",
+            "UPDATE app_prod.users SET role = 'x' WHERE id XOR id",
+            "DELETE FROM app_prod.users WHERE CASE WHEN id = 1 THEN 1 END",
+        ] {
+            match database.dispatch(sql, &ctx(), &mut state) {
+                QueryResult::Error { code, .. } => {
+                    assert_eq!(code, 1235, "{sql} must report ER_NOT_SUPPORTED_YET");
+                }
+                other => panic!("{sql} -> {other:?} is not a legal DML answer"),
+            }
+        }
+        assert!(!state.is_dirty(), "a refused DML statement changed state");
+    }
+
+    #[test]
+    fn a_zero_column_result_set_is_never_returned_for_dml() {
+        let database = database();
+        let mut state = SessionState::default();
+        for sql in [
+            "UPDATE app_prod.users SET role = 'x' WHERE id BETWEEN 1 AND 2",
+            "DELETE FROM app_prod.users WHERE id BETWEEN 1 AND 2",
+        ] {
+            match database.dispatch(sql, &ctx(), &mut state) {
+                QueryResult::ResultSet(set) => {
+                    assert!(
+                        !set.columns.is_empty(),
+                        "{sql} returned a result set with no columns"
+                    );
+                }
+                QueryResult::Error { .. } | QueryResult::Ok { .. } => {}
+                other => panic!("{sql} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dml_affected_rows_and_row_count_agree() {
+        let database = database();
+        let mut state = SessionState::default();
+        match database.dispatch(
+            "UPDATE app_prod.users SET role = 'user' WHERE id = 1",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Ok { affected_rows, .. } => assert_eq!(affected_rows, 1),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(state.row_count(), 1);
+        assert_eq!(
+            single_value_with(&database, &mut state, "SELECT ROW_COUNT()").as_deref(),
+            Some("1")
+        );
+        // Matching a row without changing it reports zero changed rows.
+        match database.dispatch(
+            "UPDATE app_prod.users SET role = 'user' WHERE id = 1",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Ok { affected_rows, .. } => assert_eq!(affected_rows, 0),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(state.row_count(), 0);
+    }
+
+    #[test]
+    fn update_over_the_string_budget_returns_data_too_long() {
+        let database = database();
+        let mut state = SessionState::default();
+        let long = "x".repeat(2_000);
+        match database.dispatch(
+            &format!("UPDATE app_prod.users SET username = '{long}' WHERE id = 1"),
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Error { code, .. } => assert_eq!(code, 1406),
+            other => panic!("{other:?}"),
+        }
+        // The row is untouched.
+        assert_eq!(
+            single_value_with(
+                &database,
+                &mut state,
+                "SELECT username FROM app_prod.users WHERE id = 1"
+            )
+            .as_deref(),
+            Some("admin")
+        );
+    }
+
+    #[test]
+    fn delete_and_truncate_return_the_budget() {
+        let database = database();
+        let mut state = SessionState::default();
+        assert!(matches!(
+            database.dispatch(
+                "INSERT INTO app_prod.users (username) VALUES ('extra')",
+                &ctx(),
+                &mut state
+            ),
+            QueryResult::Ok { .. }
+        ));
+        let grown = state.bytes();
+        assert!(matches!(
+            database.dispatch(
+                "DELETE FROM app_prod.users WHERE username = 'extra'",
+                &ctx(),
+                &mut state
+            ),
+            QueryResult::Ok {
+                affected_rows: 1,
+                ..
+            }
+        ));
+        assert!(state.bytes() < grown, "the deleted row kept its bytes");
+        let after_delete = state.bytes();
+        assert!(matches!(
+            database.dispatch("TRUNCATE TABLE app_prod.users", &ctx(), &mut state),
+            QueryResult::Ok { .. }
+        ));
+        assert!(
+            state.bytes() < after_delete,
+            "truncate kept the rows' bytes"
+        );
+        let (rows, bytes) = state.recount();
+        assert_eq!(state.rows(), rows);
+        assert_eq!(state.bytes(), bytes);
+    }
+
+    #[test]
+    fn delete_honours_order_by_and_limit() {
+        let database = database();
+        let mut state = SessionState::default();
+        match database.dispatch(
+            "DELETE FROM app_prod.users ORDER BY id DESC LIMIT 1",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Ok { affected_rows, .. } => assert_eq!(affected_rows, 1),
+            other => panic!("{other:?}"),
+        }
+        // `ORDER BY id DESC LIMIT 1` removes the highest key, not the first row.
+        let remaining: Vec<String> = match database.dispatch(
+            "SELECT username FROM app_prod.users ORDER BY id",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set
+                .rows
+                .iter()
+                .map(|row| row[0].clone().unwrap_or_default())
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(remaining, vec!["admin", "alice"]);
+    }
+
+    #[test]
+    fn multi_row_insert_is_atomic_through_the_executor() {
+        let database = database();
+        let mut state = SessionState::new(StateBudgets {
+            max_string_bytes: 8,
+            ..StateBudgets::default()
+        });
+        match database.dispatch(
+            "INSERT INTO app_prod.users (username) VALUES ('ok'), ('this-is-way-too-long')",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Error { code, .. } => assert_eq!(code, 1406),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            single_value_with(&database, &mut state, "SELECT COUNT(*) FROM app_prod.users")
+                .as_deref(),
+            Some("3"),
+            "a rejected batch must not insert a prefix of its rows"
+        );
+    }
+
+    #[test]
+    fn insert_ignore_skips_only_the_offending_rows() {
+        let database = database();
+        let mut state = SessionState::new(StateBudgets {
+            max_string_bytes: 8,
+            ..StateBudgets::default()
+        });
+        match database.dispatch(
+            "INSERT IGNORE INTO app_prod.users (username) VALUES ('ok'), ('this-is-way-too-long')",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Ok { affected_rows, .. } => assert_eq!(affected_rows, 1),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            single_value_with(&database, &mut state, "SELECT COUNT(*) FROM app_prod.users")
+                .as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn replace_keeps_one_row_per_primary_key() {
+        let database = database();
+        let mut state = SessionState::default();
+        match database.dispatch(
+            "REPLACE INTO app_prod.users (id, username) VALUES (1, 'root')",
+            &ctx(),
+            &mut state,
+        ) {
+            // MySQL reports two rows affected: one deleted, one inserted.
+            QueryResult::Ok { affected_rows, .. } => assert_eq!(affected_rows, 2),
+            other => panic!("{other:?}"),
+        }
+        let rows = match database.dispatch(
+            "SELECT username FROM app_prod.users WHERE id = 1",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::ResultSet(set) => set.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "REPLACE duplicated the primary key");
+        assert_eq!(rows[0][0].as_deref(), Some("root"));
+        let (row_count, bytes) = state.recount();
+        assert_eq!(state.rows(), row_count);
+        assert_eq!(state.bytes(), bytes);
+    }
+
+    #[test]
+    fn insert_with_a_column_count_mismatch_is_refused() {
+        let database = database();
+        let mut state = SessionState::default();
+        match database.dispatch(
+            "INSERT INTO app_prod.users VALUES ('1', 'a', 'b', 'c', 'd', 'e', 'f')",
+            &ctx(),
+            &mut state,
+        ) {
+            QueryResult::Error { code, .. } => assert_eq!(code, 1136),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_create_drop_cycle_cannot_grow_the_session() {
+        let database = database();
+        let mut state = SessionState::default();
+        for round in 0..500u32 {
+            let name = format!("t{round}");
+            assert!(matches!(
+                database.dispatch(
+                    &format!("CREATE TABLE app_prod.{name} (id bigint)"),
+                    &ctx(),
+                    &mut state
+                ),
+                QueryResult::Ok { .. }
+            ));
+            assert!(matches!(
+                database.dispatch(&format!("DROP TABLE app_prod.{name}"), &ctx(), &mut state),
+                QueryResult::Ok { .. }
+            ));
+        }
+        assert!(
+            state.bytes() < 4_096,
+            "500 create/drop cycles left {} bytes of overlay",
+            state.bytes()
+        );
+        assert_eq!(state.tombstones(), 0, "session tables need no tombstones");
+        let (rows, bytes) = state.recount();
+        assert_eq!(state.rows(), rows);
+        assert_eq!(state.bytes(), bytes);
+    }
+
+    #[test]
+    fn dropping_a_session_table_then_recreating_it_works() {
+        let database = database();
+        let mut state = SessionState::default();
+        for _ in 0..3 {
+            assert!(matches!(
+                database.dispatch(
+                    "CREATE TABLE app_prod.cycle (id bigint)",
+                    &ctx(),
+                    &mut state
+                ),
+                QueryResult::Ok { .. }
+            ));
+            assert!(matches!(
+                database.dispatch("DROP TABLE app_prod.cycle", &ctx(), &mut state),
+                QueryResult::Ok { .. }
+            ));
+            assert!(matches!(
+                database.dispatch("SELECT * FROM app_prod.cycle", &ctx(), &mut state),
+                QueryResult::Error { code: 1146, .. }
+            ));
+        }
+        assert!(state.bytes() < 4_096);
     }
 }

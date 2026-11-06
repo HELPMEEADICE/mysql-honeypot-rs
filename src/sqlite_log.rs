@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
 use tracing::{debug, error, info, warn};
@@ -39,6 +39,25 @@ pub const CONTROL_OVERFLOW: usize = 1_024;
 /// How long the writer blocks waiting for work before re-checking the overflow
 /// buffer, so a lifecycle event is never stranded behind an idle queue.
 const IDLE_POLL: Duration = Duration::from_millis(20);
+
+/// How often the writer thread re-runs the retention policy.
+///
+/// A long-running honeypot would otherwise only trim its database at startup,
+/// which is exactly when it does not need to.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rows one maintenance statement may delete.
+const MAINTENANCE_BATCH: usize = 500;
+
+/// Statements one maintenance pass may run, which bounds the pass by work done
+/// rather than by wall-clock time.
+const MAINTENANCE_MAX_BATCHES: usize = 20;
+
+/// Minimum spacing between two `VACUUM` runs.
+///
+/// `VACUUM` rewrites the whole database, so running it on every maintenance pass
+/// would turn a size cap into a periodic multi-second stall.
+const VACUUM_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Attempts at beginning a transaction before the batch is failed.
 const LOCK_ATTEMPTS: usize = 3;
@@ -389,69 +408,250 @@ fn open_database(config: &DatabaseConfig) -> rusqlite::Result<Connection> {
 ///
 /// Both mechanisms are off by default: silently deleting forensic evidence is
 /// worse than a large database, so retention must be asked for explicitly.
+///
+/// This runs at startup and then periodically from the writer thread — never
+/// from a Tokio task, because every call here is a blocking SQLite operation.
 fn enforce_retention(connection: &Connection, config: &DatabaseConfig) {
-    if config.retention_days == 0 && config.max_size_bytes == 0 {
+    if !maintenance_wanted(config) {
         return;
     }
-    if config.retention_days > 0 {
-        // Timestamps are ISO-8601 UTC strings, so a lexicographic comparison is
-        // a chronological one; `datetime('now', ...)` keeps the SQL portable.
-        let cutoff = format!("-{} days", config.retention_days);
-        let removed_queries = connection
-            .execute(
-                "DELETE FROM queries WHERE executed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
-                params![cutoff],
-            )
-            .unwrap_or(0);
-        let removed_connections = connection
-            .execute(
-                "DELETE FROM connections WHERE connected_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
-                params![cutoff],
-            )
-            .unwrap_or(0);
-        if removed_queries + removed_connections > 0 {
-            info!(
-                queries = removed_queries,
-                connections = removed_connections,
-                days = config.retention_days,
-                "retention removed old audit rows"
-            );
-        }
-    }
-    if config.max_size_bytes > 0
-        && let Some(bytes) = database_bytes(connection)
-        && bytes > config.max_size_bytes
-    {
-        // Trim the oldest rows in batches, then compact so the file actually
-        // shrinks. This runs once, at startup, on the writer thread.
-        let mut trimmed = 0usize;
-        for _ in 0..200 {
-            if database_bytes(connection).unwrap_or(0) <= config.max_size_bytes {
-                break;
-            }
-            let removed = connection
-                .execute(
-                    "DELETE FROM queries WHERE id IN (SELECT id FROM queries ORDER BY id LIMIT 500)",
-                    [],
-                )
-                .unwrap_or(0);
-            if removed == 0 {
-                break;
-            }
-            trimmed += removed;
-        }
-        if trimmed > 0 {
-            let _ = connection.execute_batch("VACUUM");
-            warn!(
-                queries = trimmed,
-                limit = config.max_size_bytes,
-                "database size cap reached, oldest audit rows removed"
-            );
-        }
+    let mut maintenance = Maintenance::default();
+    let report = run_maintenance(connection, config, &mut maintenance);
+    if report.touched() {
+        info!(
+            queries = report.queries,
+            connections = report.connections,
+            vacuumed = report.vacuumed,
+            "audit database maintenance removed old rows"
+        );
     }
 }
 
-/// Approximate on-disk size of the database, in bytes.
+/// Whether the configuration asks for any automatic cleanup at all.
+fn maintenance_wanted(config: &DatabaseConfig) -> bool {
+    config.retention_days > 0 || config.max_size_bytes > 0
+}
+
+/// Bookkeeping so maintenance stays cheap and `VACUUM` stays rare.
+#[derive(Debug, Default)]
+struct Maintenance {
+    last_run: Option<Instant>,
+    last_vacuum: Option<Instant>,
+}
+
+/// What one bounded maintenance pass did.
+#[derive(Debug, Default)]
+struct MaintenanceReport {
+    queries: usize,
+    connections: usize,
+    vacuumed: bool,
+    /// The size cap could not be met; the caller reports it honestly.
+    over_cap: bool,
+}
+
+impl MaintenanceReport {
+    fn touched(&self) -> bool {
+        self.queries > 0 || self.connections > 0 || self.vacuumed || self.over_cap
+    }
+}
+
+/// Run a bounded maintenance pass if the interval has elapsed.
+///
+/// Called from the writer thread between batches, outside any transaction, so it
+/// can never interfere with an in-flight commit.
+fn maintain_if_due(
+    connection: &Connection,
+    config: &DatabaseConfig,
+    maintenance: &mut Maintenance,
+) {
+    if !maintenance_wanted(config) {
+        return;
+    }
+    if maintenance
+        .last_run
+        .is_some_and(|last| last.elapsed() < MAINTENANCE_INTERVAL)
+    {
+        return;
+    }
+    maintenance.last_run = Some(Instant::now());
+    let report = run_maintenance(connection, config, maintenance);
+    if report.over_cap {
+        warn!(
+            limit = config.max_size_bytes,
+            "audit database is still above the configured size cap after a full cleanup pass"
+        );
+    }
+    if report.touched() {
+        debug!(
+            queries = report.queries,
+            connections = report.connections,
+            vacuumed = report.vacuumed,
+            "audit database maintenance pass"
+        );
+    }
+}
+
+/// One bounded cleanup pass: age retention, then the size cap.
+///
+/// Every loop here is capped, so a single pass cannot monopolise the writer
+/// thread, CPU or disk for an unbounded time. Whatever a pass could not finish is
+/// picked up by the next one.
+fn run_maintenance(
+    connection: &Connection,
+    config: &DatabaseConfig,
+    maintenance: &mut Maintenance,
+) -> MaintenanceReport {
+    let mut report = MaintenanceReport::default();
+    if config.retention_days > 0 {
+        let cutoff = retention_cutoff(config.retention_days);
+        // Order matters: a query is deleted together with the connection it
+        // belongs to *before* the connection row goes, so retention can never
+        // leave a query row pointing at a connection that no longer exists.
+        report.queries += delete_batched(
+            connection,
+            "DELETE FROM queries WHERE id IN (\
+                 SELECT q.id FROM queries q \
+                 JOIN connections c ON c.id = q.connection_id \
+                 WHERE c.connected_at < ?1 LIMIT ?2)",
+            &cutoff,
+        );
+        report.queries += delete_batched(
+            connection,
+            "DELETE FROM queries WHERE id IN (\
+                 SELECT id FROM queries WHERE executed_at < ?1 LIMIT ?2)",
+            &cutoff,
+        );
+        report.connections += delete_batched(
+            connection,
+            "DELETE FROM connections WHERE id IN (\
+                 SELECT id FROM connections WHERE connected_at < ?1 LIMIT ?2)",
+            &cutoff,
+        );
+    }
+
+    if config.max_size_bytes == 0 {
+        return report;
+    }
+
+    // Deleting rows frees pages but does not shrink the file, and in WAL mode the
+    // newest pages still sit in the WAL. Both have to be accounted for, or the
+    // reported size disagrees with `du`.
+    let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    let mut usage = disk_usage(connection, &config.sqlite_path);
+    if usage <= config.max_size_bytes {
+        return report;
+    }
+    report.queries += trim_oldest_queries(connection, config.max_size_bytes, &config.sqlite_path);
+    // Fold the delete traffic back into the main file before judging the result:
+    // in WAL mode the pages just freed are still sitting in the log.
+    let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    usage = disk_usage(connection, &config.sqlite_path);
+    if usage <= config.max_size_bytes {
+        return report;
+    }
+
+    // Only a `VACUUM` returns free pages to the filesystem, and it rewrites the
+    // whole database: run it rarely, never inside a transaction, and only once
+    // the cheap measures have failed.
+    let vacuum_due = maintenance
+        .last_vacuum
+        .is_none_or(|last| last.elapsed() >= VACUUM_INTERVAL);
+    if vacuum_due {
+        maintenance.last_vacuum = Some(Instant::now());
+        match connection.execute_batch("VACUUM") {
+            Ok(()) => report.vacuumed = true,
+            // A busy database is not an error worth failing over: the next pass
+            // tries again.
+            Err(err) => warn!(error = %err, "VACUUM skipped, database busy"),
+        }
+        usage = disk_usage(connection, &config.sqlite_path);
+    }
+    report.over_cap = usage > config.max_size_bytes;
+    report
+}
+
+/// ISO-8601 cutoff `days` days before now, in the canonical log format.
+///
+/// The comparison is then a plain range scan on `executed_at` / `connected_at`
+/// instead of a per-row `strftime` call, which keeps the retention pass cheap
+/// enough to run while the honeypot is under load.
+fn retention_cutoff(days: u32) -> String {
+    let back = Duration::from_secs(u64::from(days).saturating_mul(86_400));
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(back)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    crate::util::format_system_time(cutoff)
+}
+
+/// Delete oldest-first until a `VACUUM` could bring the file under the cap.
+///
+/// `DELETE` frees pages but never shrinks the file, and in WAL mode every delete
+/// also *appends* to the WAL, so measuring progress by the on-disk footprint
+/// would loop until every row was gone and only then compact — destroying far
+/// more forensic data than the cap requires. Progress is therefore measured by
+/// live pages (`page_count - freelist_count`), which is what a `VACUUM` would
+/// actually leave behind.
+fn trim_oldest_queries(connection: &Connection, cap: u64, _path: &str) -> usize {
+    let mut trimmed = 0usize;
+    for _ in 0..MAINTENANCE_MAX_BATCHES {
+        if live_bytes(connection) <= cap {
+            break;
+        }
+        match connection.execute(
+            "DELETE FROM queries WHERE id IN (SELECT id FROM queries ORDER BY id LIMIT ?1)",
+            params![MAINTENANCE_BATCH as i64],
+        ) {
+            Ok(0) => break,
+            Ok(removed) => trimmed += removed,
+            Err(err) => {
+                warn!(error = %err, "size-cap cleanup could not delete a batch");
+                break;
+            }
+        }
+    }
+    trimmed
+}
+
+/// Bytes the database will occupy once freed pages are handed back.
+///
+/// This is the size a `VACUUM` would leave behind, which is the honest measure
+/// for "is the size cap reachable".
+fn live_bytes(connection: &Connection) -> u64 {
+    database_bytes(connection)
+        .unwrap_or(0)
+        .saturating_sub(reclaimable_bytes(connection))
+}
+
+/// Bytes a `VACUUM` could hand back to the filesystem.
+fn reclaimable_bytes(connection: &Connection) -> u64 {
+    let free: i64 = connection
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap_or(0);
+    let size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap_or(0);
+    (free.max(0) as u64).saturating_mul(size.max(0) as u64)
+}
+
+/// Delete in bounded batches, returning how many rows went.
+///
+/// `statement` must take the cutoff as `?1` and the batch size as `?2`.
+fn delete_batched(connection: &Connection, statement: &str, cutoff: &str) -> usize {
+    let mut total = 0usize;
+    for _ in 0..MAINTENANCE_MAX_BATCHES {
+        match connection.execute(statement, params![cutoff, MAINTENANCE_BATCH as i64]) {
+            Ok(0) => break,
+            Ok(removed) => total += removed,
+            Err(err) => {
+                warn!(error = %err, "retention batch could not be deleted");
+                break;
+            }
+        }
+    }
+    total
+}
+
+/// Approximate on-disk size of the database, in bytes, from SQLite's own view.
 fn database_bytes(connection: &Connection) -> Option<u64> {
     let pages: i64 = connection
         .query_row("PRAGMA page_count", [], |row| row.get(0))
@@ -460,6 +660,22 @@ fn database_bytes(connection: &Connection) -> Option<u64> {
         .query_row("PRAGMA page_size", [], |row| row.get(0))
         .ok()?;
     Some((pages.max(0) as u64).saturating_mul(size.max(0) as u64))
+}
+
+/// Bytes the database actually occupies on disk, WAL companion included.
+///
+/// The main file of a WAL database does not contain the most recent commits, and
+/// deleting rows frees pages without shrinking the file, so the file sizes and
+/// SQLite's page accounting are both consulted and the larger figure wins.
+fn disk_usage(connection: &Connection, path: &str) -> u64 {
+    let from_sqlite = database_bytes(connection).unwrap_or(0);
+    let mut from_disk = 0u64;
+    for suffix in ["", "-wal"] {
+        if let Ok(metadata) = std::fs::metadata(format!("{path}{suffix}")) {
+            from_disk = from_disk.saturating_add(metadata.len());
+        }
+    }
+    from_sqlite.max(from_disk)
 }
 
 fn writer_loop(
@@ -471,6 +687,7 @@ fn writer_loop(
     failed: Arc<AtomicUsize>,
 ) {
     let mut closed = false;
+    let mut maintenance = Maintenance::default();
     loop {
         let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
         // Lifecycle events first: they are few and they carry attribution.
@@ -499,6 +716,9 @@ fn writer_loop(
         if !batch.is_empty() {
             flush_batch(&mut connection, &config, &batch, &written, &failed);
         }
+        // Between batches and outside any transaction: the retention policy can
+        // never interfere with an in-flight commit.
+        maintain_if_due(&connection, &config, &mut maintenance);
         if closed && batch.is_empty() {
             // Drain whatever the overflow buffer still holds before exiting.
             let remaining: Vec<Event> = control
@@ -1117,6 +1337,277 @@ mod tests {
         let stats = logger.stats();
         assert_eq!(stats.written, 11, "{stats:?}");
         assert_eq!(stats.failed, 0, "{stats:?}");
+        cleanup(&config);
+    }
+
+    // -- retention, size cap and maintenance --------------------------------
+
+    #[test]
+    fn retention_cutoff_is_iso8601_and_in_the_past() {
+        let cutoff = retention_cutoff(30);
+        assert_eq!(cutoff.len(), 24, "unexpected cutoff shape: {cutoff}");
+        assert!(cutoff.ends_with('Z'));
+        assert!(cutoff < crate::util::utc_now());
+        // A longer window reaches further back.
+        assert!(retention_cutoff(30) < retention_cutoff(1));
+        assert_eq!(retention_cutoff(0).len(), 24);
+    }
+
+    #[test]
+    fn maintenance_is_off_when_both_limits_are_zero() {
+        let config = temp_config(8);
+        assert!(!maintenance_wanted(&config), "zeros mean keep everything");
+        let mut by_age = config.clone();
+        by_age.retention_days = 1;
+        assert!(maintenance_wanted(&by_age));
+        let mut by_size = config.clone();
+        by_size.max_size_bytes = 1;
+        assert!(maintenance_wanted(&by_size));
+    }
+
+    #[test]
+    fn zero_limits_never_delete_forensic_data() {
+        let config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // Deliberately ancient rows: with both limits at zero nothing may go.
+        logger.record(connect_event(1, "203.0.113.1"));
+        logger.record(query_event(1, "203.0.113.1", "SELECT 1", "SELECT"));
+        logger.shutdown();
+        // Reopening runs `enforce_retention`, which must be a no-op here.
+        let logger = SqliteLogger::spawn(&config).expect("reopen");
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let queries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM queries", [], |row| row.get(0))
+            .expect("count");
+        let connections: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(queries, 1, "retention must stay off by default");
+        assert_eq!(connections, 1);
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn retention_never_orphans_a_query_row() {
+        let mut config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // An old connection carrying a recent statement.
+        logger.record(Event::Connect {
+            connection_id: 1,
+            source_ip: "203.0.113.1".to_string(),
+            source_port: 1,
+            connected_at: "1999-01-01T00:00:00.000Z".to_string(),
+        });
+        logger.record(Event::Query {
+            connection_id: 1,
+            source_ip: "203.0.113.1".to_string(),
+            username: "root".to_string(),
+            sql_text: "SELECT 1".to_string(),
+            query_type: "SELECT",
+            executed_at: crate::util::utc_now(),
+            response_type: "OK".to_string(),
+        });
+        // A recent connection carrying an ancient statement.
+        logger.record(Event::Connect {
+            connection_id: 2,
+            source_ip: "203.0.113.2".to_string(),
+            source_port: 2,
+            connected_at: crate::util::utc_now(),
+        });
+        logger.record(Event::Query {
+            connection_id: 2,
+            source_ip: "203.0.113.2".to_string(),
+            username: "root".to_string(),
+            sql_text: "SELECT 2".to_string(),
+            query_type: "SELECT",
+            executed_at: "1999-01-01T00:00:00.000Z".to_string(),
+            response_type: "OK".to_string(),
+        });
+        logger.shutdown();
+
+        config.retention_days = 30;
+        let logger = SqliteLogger::spawn(&config).expect("reopen with retention");
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let orphans: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM queries q \
+                 LEFT JOIN connections c ON c.id = q.connection_id \
+                 WHERE c.id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan count");
+        assert_eq!(orphans, 0, "a query row must never outlive its connection");
+        let connections: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(connections, 1, "only the recent connection survives");
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn a_size_cap_trims_the_oldest_rows_and_leaves_the_db_usable() {
+        let mut config = temp_config(1_024);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // One connection with many statements, so the `queries` table dominates
+        // the file. The trim then has a real choice about which rows to keep;
+        // with 800 connection *and* 800 query rows the connections table alone
+        // would put a floor under the live size and make "delete everything" the
+        // only way to reach the cap, which is what this test must not assert.
+        logger.record(connect_event(1, "203.0.113.9"));
+        for index in 0..800i64 {
+            logger.record(query_event(
+                1,
+                "203.0.113.9",
+                &format!("SELECT {index} FROM app_prod.users WHERE id = 1"),
+                "SELECT",
+            ));
+        }
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("open");
+        // Measure after a checkpoint so the cap and the trim target are the same
+        // unit: live pages, which is what a `VACUUM` would leave behind.
+        let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        let before = database_bytes(&connection).expect("page count");
+        drop(connection);
+        assert!(before > 0);
+
+        config.max_size_bytes = before * 3 / 5;
+        let logger = SqliteLogger::spawn(&config).expect("reopen under a size cap");
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("open");
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM queries", [], |row| row.get(0))
+            .expect("count");
+        assert!(
+            remaining > 0 && remaining < 800,
+            "the cap must trim some rows, not all of them (kept {remaining})"
+        );
+        // The newest rows are the ones kept.
+        let highest: i64 = connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM queries", [], |row| {
+                row.get(0)
+            })
+            .expect("max");
+        assert_eq!(highest, 800, "the oldest rows must be the ones removed");
+        let lowest: i64 = connection
+            .query_row("SELECT COALESCE(MIN(id), 0) FROM queries", [], |row| {
+                row.get(0)
+            })
+            .expect("min");
+        assert!(
+            lowest > 1,
+            "the oldest rows must be gone, kept from {lowest}"
+        );
+        // The contract: the live size -- what a `VACUUM` would leave behind -- is
+        // back under the cap. The raw file footprint is a softer bound, because
+        // SQLite cannot shrink below one page per object and the WAL has a floor
+        // of its own.
+        let live = live_bytes(&connection);
+        assert!(live < before, "the cleanup reclaimed nothing");
+        assert!(
+            live <= config.max_size_bytes,
+            "live size {live} is still above the cap {}",
+            config.max_size_bytes
+        );
+        assert!(live < before, "the cleanup reclaimed nothing");
+        let readable: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+            .expect("the database must stay readable");
+        assert!(readable > 0);
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn the_size_estimate_accounts_for_the_wal_and_the_page_count() {
+        let config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        logger.record(connect_event(1, "203.0.113.9"));
+        logger.record(query_event(1, "203.0.113.9", "SELECT 1", "SELECT"));
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("open");
+        let pages = database_bytes(&connection).expect("page count");
+        let usage = disk_usage(&connection, &config.sqlite_path);
+        assert!(usage >= pages, "usage {usage} must cover {pages} pages");
+        let main = std::fs::metadata(&config.sqlite_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        assert!(usage >= main, "usage {usage} must cover the file ({main})");
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn a_maintenance_pass_is_bounded_and_repeatable() {
+        let config = temp_config(1_024);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // Every fixture timestamp is from 2024, so a one day window expires them.
+        for id in 1..=600i64 {
+            logger.record(connect_event(id, "203.0.113.9"));
+            logger.record(query_event(id, "203.0.113.9", "SELECT 1", "SELECT"));
+        }
+        logger.shutdown();
+
+        let mut capped = config.clone();
+        capped.retention_days = 1;
+        let connection = Connection::open(&config.sqlite_path).expect("open");
+        let mut maintenance = Maintenance::default();
+        let first = run_maintenance(&connection, &capped, &mut maintenance);
+        assert!(first.queries > 0, "the pass removed nothing");
+        assert!(
+            first.queries <= MAINTENANCE_BATCH * MAINTENANCE_MAX_BATCHES,
+            "one pass deleted {} rows, above the documented bound",
+            first.queries
+        );
+        // A second pass is allowed and must stay bounded too.
+        let second = run_maintenance(&connection, &capped, &mut maintenance);
+        assert!(second.queries <= MAINTENANCE_BATCH * MAINTENANCE_MAX_BATCHES);
+
+        // Nothing is left that the policy should have removed.
+        let stale: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM queries WHERE executed_at < ?1",
+                params![retention_cutoff(capped.retention_days)],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(stale, 0);
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn the_periodic_pass_only_runs_when_it_is_due() {
+        let mut config = temp_config(64);
+        config.retention_days = 1;
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        logger.record(connect_event(1, "203.0.113.9"));
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("open");
+        let mut maintenance = Maintenance::default();
+        // The first call always runs.
+        maintain_if_due(&connection, &config, &mut maintenance);
+        assert!(maintenance.last_run.is_some());
+        let first = maintenance.last_run.expect("ran");
+        // An immediate second call must be skipped.
+        maintain_if_due(&connection, &config, &mut maintenance);
+        assert_eq!(
+            maintenance.last_run,
+            Some(first),
+            "the interval was ignored"
+        );
+        drop(connection);
         cleanup(&config);
     }
 }

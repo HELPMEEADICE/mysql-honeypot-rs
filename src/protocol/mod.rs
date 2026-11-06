@@ -3,8 +3,10 @@
 //!
 //! Only the subset a honeypot needs is implemented: packet framing, the
 //! version 10 initial handshake, the 4.1 handshake response, OK/ERR/EOF
-//! packets and text protocol result sets.
+//! packets, text protocol result sets and the binary parameter block of
+//! `COM_STMT_EXECUTE`.
 
+pub mod execute;
 pub mod handshake;
 pub mod packet;
 pub mod response;

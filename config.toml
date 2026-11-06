@@ -58,16 +58,27 @@ log_queries = true
 # and no state is kept at all.
 enabled = true
 
-# The four budgets below bound what one session may accumulate. They are what
+# The budgets below bound what one session may accumulate. They are what
 # stops a CREATE TABLE / INSERT loop from growing the process without limit.
-# Maximum tables a session may create (or clone by writing to one).
+# Every one of them is enforced *before* anything is mutated, so a statement
+# that exceeds a budget leaves the session exactly as it was.
+# Maximum tables a session may create (or clone by writing to one), and also
+# the maximum number of schemas its overlay may hold.
 max_tables = 32
 # Maximum rows in one virtual table.
 max_rows_per_table = 1000
 # Maximum rows across the whole session overlay.
 max_total_rows = 2000
-# Maximum bytes in one stored string value.
+# Maximum bytes in one stored string value (an UPDATE is re-checked against it).
 max_string_bytes = 1024
 # Maximum bytes of overlay storage per session (64 KiB). 256 sessions ×
 # 64 KiB bounds the whole overlay at 16 MiB even if every client writes.
+# This counts row containers, cell slots, column definitions, schema shells,
+# DROP tombstones and SET @var values, not just string payloads.
 max_total_bytes = 65536
+# Maximum DROP TABLE / DROP DATABASE markers one session may accumulate.
+# Only tables that exist in the base catalog need one, so a CREATE/DROP loop
+# over new names does not grow this.
+max_tombstones = 64
+# Maximum columns one CREATE TABLE may define.
+max_columns_per_table = 128

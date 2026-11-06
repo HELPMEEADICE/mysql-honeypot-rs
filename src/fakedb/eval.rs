@@ -14,7 +14,20 @@
 //!   as `0`;
 //! * two strings compare case insensitively (the `utf8mb4_0900_ai_ci`
 //!   collation the catalog advertises).
+//!
+//! `WHERE`, `ORDER BY`, `GROUP BY` and the aggregates all share the same
+//! ordering rule so they can never contradict each other:
+//!
+//! * a **numeric** key compares as `f64` with [`f64::total_cmp`], which is a
+//!   genuine total order (no `NaN` hole, so a sort can never misbehave);
+//! * a **text** key compares by its rendered string under the advertised
+//!   case-insensitive collation, which is what makes `ORDER BY username` sort
+//!   `admin < alice < bob` instead of collapsing every non numeric string to
+//!   `0`;
+//! * `NULL` sorts before every non-`NULL` value, matching MySQL's `ASC`
+//!   placement (and therefore last under `DESC`).
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 
 use super::FakeColumn;
@@ -22,6 +35,17 @@ use super::sql::{BinOp, Expr, Value, parse_number, tokenize};
 use super::state::SessionState;
 use crate::hash;
 use crate::util;
+
+/// Character comparisons one statement may spend evaluating `LIKE`.
+///
+/// The matcher is O(value × pattern); without a shared ceiling a handful of
+/// `LIKE` predicates over a full table would pin a core for every connection.
+/// Once the budget is gone the predicate answers "no match", which is the
+/// conservative direction: a filter may return fewer rows, never more.
+const LIKE_WORK_LIMIT: usize = 2_000_000;
+
+/// Longest `LIKE` pattern the matcher will consider.
+const LIKE_PATTERN_LIMIT: usize = 1_024;
 
 /// Identity and session facts an expression may read.
 #[derive(Debug, Clone)]
@@ -36,6 +60,28 @@ pub struct EvalContext {
     pub connection_id: u32,
     /// Advertised server version.
     pub server_version: String,
+    /// Remaining `LIKE` work for this statement.
+    pub like_budget: Cell<usize>,
+}
+
+impl EvalContext {
+    /// A context with a fresh `LIKE` budget.
+    pub fn new(
+        current_db: String,
+        username: String,
+        client_host: String,
+        connection_id: u32,
+        server_version: String,
+    ) -> Self {
+        Self {
+            current_db,
+            username,
+            client_host,
+            connection_id,
+            server_version,
+            like_budget: Cell::new(LIKE_WORK_LIMIT),
+        }
+    }
 }
 
 /// Why an expression could not be evaluated.
@@ -153,39 +199,142 @@ fn cell_value(row: &[Option<String>], index: usize) -> Value {
 }
 
 /// Compare two values with MySQL coercion rules; `None` for an unknown result.
+///
+/// `numeric` selects the interpretation of the operands. Both branches return a
+/// **total** order over everything except `NULL`, so a comparator built on this
+/// function is always consistent and transitive.
 pub fn compare_values(left: &Value, right: &Value, numeric: bool) -> Option<Ordering> {
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return None;
     }
     if numeric {
-        return match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
-            _ => {
-                let a = left.as_f64().unwrap_or(0.0);
-                let b = right.as_f64().unwrap_or(0.0);
-                a.partial_cmp(&b)
-            }
-        };
+        // `total_cmp` gives a real total order (NaN included) and `as_f64`
+        // already maps an unparsable string to `0.0` the way MySQL coerces it.
+        // No type-based tie-break here: `'admin' = 0` has to stay true, which is
+        // exactly what MySQL does. `SortKey` is what adds determinism for
+        // sorting.
+        let a = left.as_f64().unwrap_or(0.0);
+        let b = right.as_f64().unwrap_or(0.0);
+        return Some(a.total_cmp(&b));
     }
-    match (left, right) {
-        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
-        (Value::Text(a), Value::Text(b)) => Some(case_insensitive_cmp(a, b)),
-        // A number on either side turns the comparison numeric.
-        _ => {
-            let a = left.as_f64().unwrap_or(0.0);
-            let b = right.as_f64().unwrap_or(0.0);
-            a.partial_cmp(&b)
+    // Text mode is a pure function of the renderings, which is what makes it
+    // transitive. A mixed numeric/text fast path here would break transitivity —
+    // and `slice::sort_by` is allowed to panic on a comparator that does not
+    // describe a total order.
+    Some(collate(left, right))
+}
+
+/// Compare two values by their rendered text under the `ai_ci` collation.
+fn collate(left: &Value, right: &Value) -> Ordering {
+    let left = left.to_wire().unwrap_or_default();
+    let right = right.to_wire().unwrap_or_default();
+    case_insensitive_cmp(&left, &right)
+}
+
+/// A pre-computed ordering key for `ORDER BY` / `GROUP BY`.
+///
+/// Building the key once per row turns the comparator into a handful of
+/// comparisons: no lowercasing, no allocation and — critically — no chance of an
+/// inconsistent `sort_by` closure, which `slice::sort_by` may exploit to panic.
+#[derive(Debug, Clone)]
+pub enum SortKey {
+    /// The SQL `NULL`, ordered before every non-`NULL` value.
+    Null,
+    /// A numeric interpretation.
+    Number(f64),
+    /// A lowercased rendering for the case-insensitive collation.
+    Text(String),
+}
+
+impl SortKey {
+    /// Build the ordering key for one value.
+    pub fn new(value: &Value, numeric: bool) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            other if numeric => Self::Number(other.as_f64().unwrap_or(0.0)),
+            other => Self::Text(other.to_wire().unwrap_or_default().to_lowercase()),
         }
     }
 }
 
-/// `utf8mb4_0900_ai_ci` style comparison: case insensitive, then byte order.
+impl Ord for SortKey {
+    /// Total order over keys: `NULL` first, then numbers, then text.
+    ///
+    /// `f64::total_cmp` is used rather than `partial_cmp`, so the order stays
+    /// total even when a hostile query produces a `NaN`.
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Null, _) => Ordering::Less,
+            (_, Self::Null) => Ordering::Greater,
+            (Self::Number(a), Self::Number(b)) => a.total_cmp(b),
+            (Self::Number(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Number(_)) => Ordering::Greater,
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SortKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SortKey {}
+
+/// Whether an `ORDER BY` / `GROUP BY` key should compare numerically.
+///
+/// The decision follows the declared column type, so `ORDER BY id` is numeric
+/// while `ORDER BY username` is a real dictionary comparison. Anything that is
+/// not known to produce text is treated as numeric, which keeps numbers and
+/// `0`/`1` predicates ordered correctly.
+pub fn sort_is_numeric(expression: &Expr, columns: &[FakeColumn]) -> bool {
+    fn produces_text(expression: &Expr, columns: &[FakeColumn]) -> bool {
+        match expression {
+            Expr::Column(name) => column_index(columns, name)
+                .is_some_and(|index| !is_numeric_type(&columns[index].data_type)),
+            Expr::Literal(value) => matches!(value, Value::Text(_)),
+            Expr::UserVar(_) | Expr::SysVar(_) => true,
+            Expr::Neg(inner) => produces_text(inner, columns),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::InList { .. } | Expr::Like { .. } => false,
+            // Arithmetic and comparisons both produce numbers.
+            Expr::Binary(_, _, _) => false,
+            Expr::Func { name, args, .. } => match name.to_ascii_uppercase().as_str() {
+                "MIN" | "MAX" | "IFNULL" | "COALESCE" | "NULLIF" | "IF" => {
+                    args.first().is_some_and(|arg| produces_text(arg, columns))
+                }
+                "CONCAT" | "CONCAT_WS" | "UPPER" | "UCASE" | "LOWER" | "LCASE" | "TRIM"
+                | "LTRIM" | "RTRIM" | "REPLACE" | "SUBSTRING" | "SUBSTR" | "MID" | "LEFT"
+                | "RIGHT" | "REVERSE" | "REPEAT" | "MD5" | "SHA" | "SHA1" | "SHA2" | "PASSWORD"
+                | "OLD_PASSWORD" | "HEX" | "UNHEX" | "USER" | "SESSION_USER" | "SYSTEM_USER"
+                | "CURRENT_USER" | "DATABASE" | "SCHEMA" | "VERSION" | "VERSION_COMMENT"
+                | "NOW" | "CURRENT_TIMESTAMP" | "SYSDATE" | "LOCALTIME" | "LOCALTIMESTAMP"
+                | "CURDATE" | "CURRENT_DATE" | "CURTIME" | "CURRENT_TIME" | "UUID" | "CAST"
+                | "CONVERT" => true,
+                _ => false,
+            },
+        }
+    }
+    !produces_text(expression, columns)
+}
+
+/// `utf8mb4_0900_ai_ci` comparison: case insensitive, accent rules ignored.
+///
+/// There is deliberately no exact-byte tie-break: under `ai_ci` the strings
+/// `Admin` and `admin` *are* equal, in `WHERE`, `GROUP BY` and `ORDER BY` alike.
+/// A tie-break here would make `WHERE username = 'ALICE'` miss `alice`, which the
+/// advertised collation says is the same value. The relation is still a total
+/// preorder (a pure function of the lowercased text), so it is transitive and a
+/// comparator built on it is consistent.
 fn case_insensitive_cmp(left: &str, right: &str) -> Ordering {
-    let lowered_left = left.to_lowercase();
-    let lowered_right = right.to_lowercase();
-    lowered_left
-        .cmp(&lowered_right)
-        .then_with(|| left.cmp(right))
+    left.to_lowercase().cmp(&right.to_lowercase())
 }
 
 /// Decide whether a comparison should be numeric.
@@ -213,15 +362,44 @@ fn numeric_comparison(left_expr: &Expr, right_expr: &Expr, columns: &[FakeColumn
 /// `LIKE` matching with `%` and `_`, case insensitive, no backtracking blow-up.
 ///
 /// The implementation is the classic single-star backtracking scan: it is
-/// O(value × pattern) worst case and can never recurse.
+/// O(value × pattern) worst case and can never recurse. This wrapper has no work
+/// ceiling — the statement path uses [`like_match_bounded`], which does.
 pub fn like_match(pattern: &str, value: &str) -> bool {
+    like_match_inner(pattern, value, None).unwrap_or(false)
+}
+
+/// `LIKE` matching that charges its work against a per-statement budget.
+///
+/// Returns `false` once the budget is exhausted: a filter may lose rows under
+/// load, but it can never invent them.
+pub fn like_match_bounded(pattern: &str, value: &str, budget: &Cell<usize>) -> bool {
+    like_match_inner(pattern, value, Some(budget)).unwrap_or(false)
+}
+
+/// `Some(matched)`, or `None` when the work budget ran out.
+fn like_match_inner(pattern: &str, value: &str, budget: Option<&Cell<usize>>) -> Option<bool> {
+    if pattern.len() > LIKE_PATTERN_LIMIT * 4 {
+        // A pattern longer than any value we store cannot match usefully, and
+        // it is the multiplier that makes the scan expensive.
+        return Some(false);
+    }
     let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    if pattern.len() > LIKE_PATTERN_LIMIT {
+        return Some(false);
+    }
     let value: Vec<char> = value.to_lowercase().chars().collect();
     let mut pattern_index = 0usize;
     let mut value_index = 0usize;
     let mut star_index: Option<usize> = None;
     let mut star_value_index = 0usize;
     while value_index < value.len() {
+        if let Some(budget) = budget {
+            let remaining = budget.get();
+            if remaining == 0 {
+                return None;
+            }
+            budget.set(remaining - 1);
+        }
         let mut advanced = false;
         if pattern_index < pattern.len() {
             match pattern[pattern_index] {
@@ -260,14 +438,14 @@ pub fn like_match(pattern: &str, value: &str) -> bool {
                     value_index = star_value_index;
                     pattern_index = star + 1;
                 }
-                None => return false,
+                None => return Some(false),
             }
         }
     }
     while pattern_index < pattern.len() && pattern[pattern_index] == '%' {
         pattern_index += 1;
     }
-    pattern_index == pattern.len()
+    Some(pattern_index == pattern.len())
 }
 
 /// Evaluate `expression` against one row.
@@ -353,7 +531,7 @@ pub fn evaluate(expression: &Expr, context: &RowContext<'_>) -> Result<Value, Ev
                 // MySQL: LIKE with a NULL operand is NULL.
                 return Ok(Value::Null);
             };
-            let matched = like_match(&pattern, &value);
+            let matched = like_match_bounded(&pattern, &value, &context.session.like_budget);
             Ok(Value::Int(i64::from(matched != *negated)))
         }
         Expr::Binary(operator, left, right) => match operator {
@@ -464,6 +642,19 @@ fn text_argument(values: &[Value], index: usize) -> Option<String> {
     })
 }
 
+/// Wrap a produced string, clipping it to the per-value budget.
+///
+/// `CONCAT`, `REPLACE` and `UPPER` can be handed a 16 KiB literal and return
+/// more than they were given; without this ceiling one statement could pin far
+/// more memory than the virtual database budgets allow a stored value.
+fn text_value(text: String) -> Value {
+    if text.len() > super::MAX_STRING_VALUE_BYTES {
+        Value::Text(util::truncate_to(&text, super::MAX_STRING_VALUE_BYTES).0)
+    } else {
+        Value::Text(text)
+    }
+}
+
 fn call_scalar(
     name: &str,
     values: &[Value],
@@ -492,14 +683,8 @@ fn call_scalar(
         "NOW" | "CURRENT_TIMESTAMP" | "SYSDATE" | "LOCALTIME" | "LOCALTIMESTAMP" => {
             Ok(Value::Text(sql_datetime(&util::utc_now())))
         }
-        "CURDATE" | "CURRENT_DATE" => {
-            let now = util::utc_now();
-            Ok(Value::Text(now[..10].to_string()))
-        }
-        "CURTIME" | "CURRENT_TIME" => {
-            let now = util::utc_now();
-            Ok(Value::Text(now[11..19].to_string()))
-        }
+        "CURDATE" | "CURRENT_DATE" => Ok(Value::Text(date_part(&util::utc_now()))),
+        "CURTIME" | "CURRENT_TIME" => Ok(Value::Text(time_part(&util::utc_now()))),
         "UNIX_TIMESTAMP" => Ok(Value::Int(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -545,11 +730,11 @@ fn call_scalar(
             None => Value::Null,
         }),
         "UPPER" | "UCASE" => Ok(match text_argument(values, 0) {
-            Some(text) => Value::Text(text.to_uppercase()),
+            Some(text) => text_value(text.to_uppercase()),
             None => Value::Null,
         }),
         "LOWER" | "LCASE" => Ok(match text_argument(values, 0) {
-            Some(text) => Value::Text(text.to_lowercase()),
+            Some(text) => text_value(text.to_lowercase()),
             None => Value::Null,
         }),
         "HEX" => Ok(match text_argument(values, 0) {
@@ -560,7 +745,7 @@ fn call_scalar(
             Some(text) => {
                 let bytes = decode_hex(&text);
                 match bytes {
-                    Some(bytes) => Value::Text(String::from_utf8_lossy(&bytes).into_owned()),
+                    Some(bytes) => text_value(String::from_utf8_lossy(&bytes).into_owned()),
                     None => Value::Null,
                 }
             }
@@ -574,7 +759,7 @@ fn call_scalar(
             if values.iter().any(|value| matches!(value, Value::Null)) {
                 return Ok(Value::Null);
             }
-            Ok(Value::Text(
+            Ok(text_value(
                 values
                     .iter()
                     .map(|value| value.to_wire().unwrap_or_default())
@@ -591,7 +776,7 @@ fn call_scalar(
                 .skip(1)
                 .filter_map(|value| value.to_wire())
                 .collect();
-            Ok(Value::Text(parts.join(&separator)))
+            Ok(text_value(parts.join(&separator)))
         }
         "TRIM" => Ok(match text_argument(values, 0) {
             Some(text) => Value::Text(text.trim().to_string()),
@@ -612,7 +797,7 @@ fn call_scalar(
                 text_argument(values, 2),
             ) {
                 (Some(haystack), Some(needle), Some(replacement)) => {
-                    Value::Text(haystack.replace(&needle, &replacement))
+                    text_value(haystack.replace(&needle, &replacement))
                 }
                 _ => Value::Null,
             },
@@ -633,7 +818,13 @@ fn call_scalar(
             };
             let begin = begin.min(chars.len());
             let end = match length {
-                Some(length) if length > 0.0 => (begin + length as usize).min(chars.len()),
+                // `saturating_add`, not `+`: `length as usize` saturates to
+                // `usize::MAX` for a hostile `SUBSTRING(x, 1, 1e300)`, and the
+                // wrapped sum would make `begin > end`, which panics on slice
+                // indexing.
+                Some(length) if length > 0.0 => {
+                    begin.saturating_add(length as usize).min(chars.len())
+                }
                 Some(_) => begin,
                 None => chars.len(),
             };
@@ -666,7 +857,7 @@ fn call_scalar(
             },
         ),
         "REVERSE" => Ok(match text_argument(values, 0) {
-            Some(text) => Value::Text(text.chars().rev().collect()),
+            Some(text) => text_value(text.chars().rev().collect()),
             None => Value::Null,
         }),
         "REPEAT" => Ok(
@@ -712,10 +903,20 @@ fn call_scalar(
                 .unwrap_or(0);
             if places <= 0 {
                 let factor = 10f64.powi(-places);
-                Ok(Value::Int((number / factor).round() as i64 * factor as i64))
+                // `factor as i64` saturates for `places = -30`, and the product
+                // of two saturated values overflows: use checked arithmetic so a
+                // hostile `ROUND(1e308, -30)` cannot trap the process.
+                let scaled = (number / factor).round();
+                let scaled = if scaled.is_finite() { scaled as i64 } else { 0 };
+                Ok(Value::Int(scaled.saturating_mul(factor as i64)))
             } else {
                 let factor = 10f64.powi(places);
-                Ok(Value::Float((number * factor).round() / factor))
+                let result = (number * factor).round() / factor;
+                Ok(if result.is_finite() {
+                    Value::Float(result)
+                } else {
+                    Value::Null
+                })
             }
         }
         "SIGN" => Ok(match values.first().and_then(Value::as_f64) {
@@ -824,6 +1025,10 @@ fn random_uuid() -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex = hash::hex_upper(&bytes).to_lowercase();
+    // Defensive: the slices below assume 32 hex characters.
+    if hex.len() != 32 {
+        return "00000000-0000-4000-8000-000000000000".to_string();
+    }
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
@@ -836,10 +1041,36 @@ fn random_uuid() -> String {
 
 fn sql_datetime(timestamp: &str) -> String {
     if timestamp.len() >= 19 {
-        format!("{} {}", &timestamp[0..10], &timestamp[11..19])
+        format!("{} {}", date_part(timestamp), time_part(timestamp))
     } else {
         timestamp.to_string()
     }
+}
+
+/// `YYYY-MM-DD` of a `YYYY-MM-DDTHH:MM:SS…` timestamp.
+///
+/// Slicing is guarded by `is_char_boundary` so a caller that ever hands over a
+/// non-ASCII string gets a truncated answer instead of a panic.
+fn date_part(timestamp: &str) -> String {
+    let end = timestamp.len().min(10);
+    match timestamp.get(..end) {
+        Some(text) if text.is_char_boundary(text.len()) => text.to_string(),
+        _ => timestamp.to_string(),
+    }
+}
+
+/// `HH:MM:SS` of a `YYYY-MM-DDTHH:MM:SS…` timestamp.
+fn time_part(timestamp: &str) -> String {
+    let start = 11.min(timestamp.len());
+    let end = 19.min(timestamp.len());
+    if start < end
+        && timestamp.is_char_boundary(start)
+        && timestamp.is_char_boundary(end)
+        && let Some(text) = timestamp.get(start..end)
+    {
+        return text.to_string();
+    }
+    timestamp.to_string()
 }
 
 /// Convenience used by the selector: parse `text` as a standalone expression.
@@ -884,13 +1115,13 @@ mod tests {
     }
 
     fn session() -> EvalContext {
-        EvalContext {
-            current_db: "app_prod".to_string(),
-            username: "root".to_string(),
-            client_host: "203.0.113.9".to_string(),
-            connection_id: 7,
-            server_version: "8.0.36".to_string(),
-        }
+        EvalContext::new(
+            "app_prod".to_string(),
+            "root".to_string(),
+            "203.0.113.9".to_string(),
+            7,
+            "8.0.36".to_string(),
+        )
     }
 
     fn run(sql: &str) -> Result<Value, EvalError> {
@@ -1059,5 +1290,198 @@ mod tests {
         assert!(is_numeric_type("decimal(10,2)"));
         assert!(!is_numeric_type("varchar(64)"));
         assert!(!is_numeric_type("datetime"));
+    }
+
+    #[test]
+    fn text_sort_keys_are_dictionary_ordered() {
+        let mut keys: Vec<SortKey> = ["bob", "alice", "admin", "alice2"]
+            .iter()
+            .map(|name| SortKey::new(&Value::Text((*name).to_string()), false))
+            .collect();
+        keys.sort_by(SortKey::cmp);
+        let ordered: Vec<String> = keys
+            .iter()
+            .map(|key| match key {
+                SortKey::Text(text) => text.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(ordered, vec!["admin", "alice", "alice2", "bob"]);
+    }
+
+    #[test]
+    fn numeric_sort_keys_are_value_ordered() {
+        let mut keys: Vec<SortKey> = ["10", "9", "100", "2"]
+            .iter()
+            .map(|number| SortKey::new(&Value::Text((*number).to_string()), true))
+            .collect();
+        keys.sort_by(SortKey::cmp);
+        let ordered: Vec<f64> = keys
+            .iter()
+            .map(|key| match key {
+                SortKey::Number(number) => *number,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(ordered, vec![2.0, 9.0, 10.0, 100.0]);
+    }
+
+    #[test]
+    fn non_numeric_strings_are_not_all_equal() {
+        // The bug this guards: with a forced numeric comparison every string
+        // reads as `0`, so `admin`, `alice` and `bob` all compare equal and the
+        // sort order collapses to insertion order.
+        let values = [
+            Value::Text("bob".to_string()),
+            Value::Text("admin".to_string()),
+            Value::Text("alice".to_string()),
+        ];
+        assert_eq!(
+            compare_values(&values[1], &values[2], false),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&values[2], &values[0], false),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&values[1], &values[0], false),
+            Some(Ordering::Less)
+        );
+        // And a forced numeric comparison really does collapse them — this is
+        // exactly the regression that a hard-coded `numeric = true` produced for
+        // every `ORDER BY` over a `varchar` column.
+        for left in &values {
+            for right in &values {
+                assert_eq!(
+                    compare_values(left, right, true),
+                    Some(Ordering::Equal),
+                    "{left:?} and {right:?} must both coerce to 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sort_keys_form_a_total_order() {
+        let values = [
+            Value::Null,
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Float(2.5),
+            Value::Float(f64::NAN),
+            Value::Text("abc".to_string()),
+            Value::Text("10".to_string()),
+            Value::Text(String::new()),
+        ];
+        for numeric in [true, false] {
+            let keys: Vec<SortKey> = values
+                .iter()
+                .map(|value| SortKey::new(value, numeric))
+                .collect();
+            // Totality: every pair must compare, and the result must be
+            // antisymmetric.
+            for left in &keys {
+                for right in &keys {
+                    let forward = left.cmp(right);
+                    let backward = right.cmp(left);
+                    assert_eq!(forward, backward.reverse(), "not antisymmetric");
+                }
+            }
+            // Transitivity on the strict part, which is what `sort_by` requires.
+            for a in &keys {
+                for b in &keys {
+                    for c in &keys {
+                        if a.cmp(b) == Ordering::Less && b.cmp(c) == Ordering::Less {
+                            assert_eq!(a.cmp(c), Ordering::Less, "not transitive");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn null_sorts_before_everything_ascending() {
+        let null = SortKey::new(&Value::Null, true);
+        let zero = SortKey::new(&Value::Int(0), true);
+        let text = SortKey::new(&Value::Text("a".to_string()), false);
+        let text_null = SortKey::new(&Value::Null, false);
+        assert_eq!(null.cmp(&zero), Ordering::Less);
+        assert_eq!(text_null.cmp(&text), Ordering::Less);
+    }
+
+    #[test]
+    fn sort_is_numeric_follows_the_column_type() {
+        let columns = columns();
+        let identifier = Expr::Column("id".to_string());
+        let username = Expr::Column("username".to_string());
+        assert!(sort_is_numeric(&identifier, &columns));
+        assert!(!sort_is_numeric(&username, &columns));
+        // A string function keeps the text collation.
+        let upper = super::parse("UPPER(username)").expect("parse");
+        assert!(!sort_is_numeric(&upper, &columns));
+        // An aggregate over a text column stays textual.
+        let minimum = super::parse("MIN(username)").expect("parse");
+        assert!(!sort_is_numeric(&minimum, &columns));
+        let count = super::parse("COUNT(username)").expect("parse");
+        assert!(sort_is_numeric(&count, &columns));
+    }
+
+    #[test]
+    fn substring_with_a_hostile_length_does_not_overflow() {
+        // `1e300 as usize` saturates; a plain `+` would wrap and produce
+        // `begin > end`, which panics while slicing.
+        assert!(
+            matches!(run("SUBSTRING('abcdef', 2, 1e300)"), Ok(Value::Text(ref text)) if text == "bcdef")
+        );
+        assert!(matches!(
+            run("SUBSTRING('abcdef', -1e300, 3)"),
+            Ok(Value::Text(_))
+        ));
+        assert!(
+            matches!(run("SUBSTRING('abcdef', 3, -1e300)"), Ok(Value::Text(ref text)) if text.is_empty())
+        );
+    }
+
+    #[test]
+    fn round_with_a_hostile_scale_does_not_overflow() {
+        // `10f64.powi(30) as i64` saturates to `i64::MAX`, so the surrounding
+        // multiplication has to be saturating as well.
+        assert!(run("ROUND(1e308, -30)").is_ok());
+        assert!(run("ROUND(-1e308, -30)").is_ok());
+        assert!(run("ROUND(1e308, 30)").is_ok());
+    }
+
+    #[test]
+    fn like_work_budget_stops_a_hostile_pattern() {
+        let budget = Cell::new(64);
+        let pattern = "%a".repeat(200) + "%b";
+        let value = "a".repeat(4_000);
+        assert!(!like_match_bounded(&pattern, &value, &budget));
+        assert_eq!(budget.get(), 0, "the budget must be spent, not reset");
+        // An exhausted budget answers "no match" rather than looping.
+        assert!(!like_match_bounded("a%", "abc", &budget));
+    }
+
+    #[test]
+    fn like_pattern_length_is_capped() {
+        let budget = Cell::new(LIKE_WORK_LIMIT);
+        let pattern = "x".repeat(LIKE_PATTERN_LIMIT + 8);
+        assert!(!like_match_bounded(&pattern, "xxxx", &budget));
+        assert_eq!(
+            budget.get(),
+            LIKE_WORK_LIMIT,
+            "an over-long pattern must be refused before any work"
+        );
+    }
+
+    #[test]
+    fn produced_strings_stay_within_the_value_budget() {
+        let long = "x".repeat(8_000);
+        match text_value(long.to_uppercase()) {
+            Value::Text(text) => assert!(text.len() <= super::super::MAX_STRING_VALUE_BYTES),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -143,6 +143,10 @@ pub struct VirtualDbConfig {
     pub max_string_bytes: usize,
     /// Maximum bytes of overlay storage per session.
     pub max_total_bytes: usize,
+    /// Maximum `DROP` tombstones one session may accumulate.
+    pub max_tombstones: usize,
+    /// Maximum columns one `CREATE TABLE` may define.
+    pub max_columns_per_table: usize,
 }
 
 impl Default for VirtualDbConfig {
@@ -156,6 +160,8 @@ impl Default for VirtualDbConfig {
             // 64 KiB per session × 256 sessions = 16 MiB worst case, which fits
             // comfortably inside the container's 128 MiB budget.
             max_total_bytes: 64 * 1_024,
+            max_tombstones: 64,
+            max_columns_per_table: 128,
         }
     }
 }
@@ -171,6 +177,8 @@ impl VirtualDbConfig {
             max_string_bytes: self.max_string_bytes,
             max_total_bytes: self.max_total_bytes,
             max_user_variables: 64,
+            max_tombstones: self.max_tombstones,
+            max_columns_per_table: self.max_columns_per_table,
         }
     }
 }
@@ -286,6 +294,10 @@ impl Config {
         self.virtualdb.max_string_bytes = self.virtualdb.max_string_bytes.clamp(16, 1_048_576);
         self.virtualdb.max_total_bytes =
             self.virtualdb.max_total_bytes.clamp(4_096, 64 * 1_048_576);
+        // Zero would make `DROP` or `CREATE TABLE` impossible outright, which is
+        // never what an operator meant to configure.
+        self.virtualdb.max_tombstones = self.virtualdb.max_tombstones.clamp(1, 4_096);
+        self.virtualdb.max_columns_per_table = self.virtualdb.max_columns_per_table.clamp(1, 4_000);
 
         if self.logging.level.trim().is_empty() {
             self.logging.level = LoggingConfig::default().level;

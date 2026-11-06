@@ -548,6 +548,134 @@ impl Client {
             }
         }
     }
+
+    /// `COM_STMT_PREPARE`, returning `(statement_id, parameter count)`.
+    async fn prepare(&mut self, sql: &str) -> (u32, u16) {
+        self.send_raw(&command(0x16, sql.as_bytes())).await;
+        let prepare = self.read_packet().await;
+        assert_eq!(
+            prepare[0], 0x00,
+            "COM_STMT_PREPARE must answer with COM_STMT_PREPARE_OK, got {prepare:?}"
+        );
+        let mut reader = PayloadReader::new(&prepare);
+        reader.u8().expect("header");
+        let statement_id = reader.u32le().expect("statement id");
+        let columns = reader.u16le().expect("column count");
+        let parameters = reader.u16le().expect("parameter count");
+        for _ in 0..parameters {
+            let _ = self.read_packet().await;
+        }
+        if parameters > 0 && self.capabilities & CLIENT_DEPRECATE_EOF == 0 {
+            assert_eq!(self.read_packet().await[0], 0xfe);
+        }
+        for _ in 0..columns {
+            let _ = self.read_packet().await;
+        }
+        if columns > 0 && self.capabilities & CLIENT_DEPRECATE_EOF == 0 {
+            assert_eq!(self.read_packet().await[0], 0xfe);
+        }
+        (statement_id, parameters)
+    }
+
+    /// `COM_STMT_EXECUTE` with a real parameter block.
+    ///
+    /// `send_types` maps to `new_params_bound_flag`: when it is `false` the
+    /// server has to reuse the types from the previous execute.
+    async fn execute(&mut self, statement_id: u32, params: &[Param], send_types: bool) -> Response {
+        self.execute_raw(&execute_payload(statement_id, params, send_types, 0x00, 1))
+            .await
+    }
+
+    /// `COM_STMT_EXECUTE` straight from a payload, for hostile-packet tests.
+    async fn execute_raw(&mut self, body: &[u8]) -> Response {
+        self.send_raw(&command(0x17, body)).await;
+        self.read_binary_response().await
+    }
+
+    /// `COM_STMT_RESET`; answers OK.
+    async fn reset_statement(&mut self, statement_id: u32) {
+        self.send_raw(&command(0x1a, &statement_id.to_le_bytes()))
+            .await;
+        let response = self.read_packet().await;
+        assert_eq!(response[0], 0x00, "COM_STMT_RESET must answer OK");
+    }
+
+    /// `COM_STMT_CLOSE` expects no reply.
+    async fn close_statement(&mut self, statement_id: u32) {
+        self.send_raw(&command(0x19, &statement_id.to_le_bytes()))
+            .await;
+    }
+}
+
+/// Build a `COM_STMT_EXECUTE` body.
+fn execute_payload(
+    statement_id: u32,
+    params: &[Param],
+    send_types: bool,
+    flags: u8,
+    iteration_count: u32,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&statement_id.to_le_bytes());
+    body.push(flags);
+    body.extend_from_slice(&iteration_count.to_le_bytes());
+    if !params.is_empty() {
+        let mut bitmap = vec![0u8; params.len().div_ceil(8)];
+        for (index, param) in params.iter().enumerate() {
+            if matches!(param, Param::Null) {
+                bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        body.extend_from_slice(&bitmap);
+        body.push(u8::from(send_types));
+        if send_types {
+            for param in params {
+                let (wire, unsigned) = param.wire_type();
+                body.push(wire);
+                body.push(unsigned);
+            }
+        }
+        for param in params {
+            param.encode(&mut body);
+        }
+    }
+    body
+}
+
+/// One bound parameter for `COM_STMT_EXECUTE`, with the wire type it is sent as.
+#[derive(Debug, Clone, PartialEq)]
+enum Param {
+    /// `MYSQL_TYPE_LONGLONG`
+    Int(i64),
+    /// `MYSQL_TYPE_DOUBLE`
+    Double(f64),
+    /// `MYSQL_TYPE_VAR_STRING`
+    Str(String),
+    /// `MYSQL_TYPE_NULL`, also flagged in the NULL bitmap
+    Null,
+}
+
+impl Param {
+    fn wire_type(&self) -> (u8, u8) {
+        match self {
+            Self::Int(_) => (0x08, 0),
+            Self::Double(_) => (0x05, 0),
+            Self::Str(_) => (0xfd, 0),
+            Self::Null => (0x06, 0),
+        }
+    }
+
+    fn encode(&self, body: &mut Vec<u8>) {
+        match self {
+            Self::Int(value) => body.extend_from_slice(&value.to_le_bytes()),
+            Self::Double(value) => body.extend_from_slice(&value.to_le_bytes()),
+            Self::Str(text) => {
+                body.push(text.len() as u8);
+                body.extend_from_slice(text.as_bytes());
+            }
+            Self::Null => {}
+        }
+    }
 }
 
 fn command(command_byte: u8, body: &[u8]) -> Vec<u8> {
@@ -1580,6 +1708,279 @@ async fn log_counters_account_for_every_event() {
         .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
         .expect("count");
     assert_eq!(connections, 1);
+    drop(database);
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_statements_bind_typed_parameters() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, parameters) = client
+        .prepare("SELECT username FROM app_prod.users WHERE id = ?")
+        .await;
+    assert_eq!(parameters, 1, "one placeholder, one parameter");
+
+    // An integer parameter against a numeric column.
+    let (columns, rows) = client
+        .execute(statement, &[Param::Int(1)], true)
+        .await
+        .expect_result();
+    assert_eq!(columns, vec!["username".to_string()]);
+    assert_eq!(rows, vec![vec!["admin".to_string()]]);
+
+    // The same prepared statement re-executed with another value.
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(3)], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["bob".to_string()]]);
+
+    // `new_params_bound_flag = 0`: the client reuses the previous types.
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(2)], false)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["alice".to_string()]]);
+
+    // A value matching nothing is an empty result set, not an error.
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(99)], true)
+        .await
+        .expect_result();
+    assert!(rows.is_empty());
+
+    client.close_statement(statement).await;
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_statements_bind_strings_floats_and_null() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, _) = client
+        .prepare("SELECT username FROM app_prod.users WHERE username = ?")
+        .await;
+    let (_, rows) = client
+        .execute(statement, &[Param::Str("alice".to_string())], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["alice".to_string()]]);
+
+    // The case-insensitive collation applies to a bound string too.
+    let (_, rows) = client
+        .execute(statement, &[Param::Str("ALICE".to_string())], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["alice".to_string()]]);
+
+    // A NULL parameter matches nothing, like `= NULL` in SQL.
+    let (_, rows) = client
+        .execute(statement, &[Param::Null], true)
+        .await
+        .expect_result();
+    assert!(rows.is_empty(), "a NULL parameter must not match");
+    client.close_statement(statement).await;
+
+    // A double parameter against a numeric column.
+    let (statement, _) = client
+        .prepare("SELECT username FROM app_prod.users WHERE id > ?")
+        .await;
+    let (_, rows) = client
+        .execute(statement, &[Param::Double(2.5)], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["bob".to_string()]]);
+    client.close_statement(statement).await;
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_string_cannot_change_the_statement_shape() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, _) = client
+        .prepare("SELECT username FROM app_prod.users WHERE username = ?")
+        .await;
+    // The classic injection payload: bound as data it is just a string that
+    // matches no row, instead of widening the predicate.
+    for payload in [
+        "' OR 1=1 -- ",
+        "admin' --",
+        "%",
+        "admin' OR username LIKE '%",
+    ] {
+        let (_, rows) = client
+            .execute(statement, &[Param::Str(payload.to_string())], true)
+            .await
+            .expect_result();
+        assert!(
+            rows.is_empty(),
+            "payload {payload:?} widened the predicate to {} rows",
+            rows.len()
+        );
+    }
+    client.close_statement(statement).await;
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_statements_reject_malformed_executions() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, parameters) = client
+        .prepare("SELECT username FROM app_prod.users WHERE id = ?")
+        .await;
+    assert_eq!(parameters, 1);
+
+    // An unknown statement id.
+    match client.execute(999, &[Param::Int(1)], true).await {
+        Response::Err { code, .. } => assert_eq!(code, 1243),
+        other => panic!("unknown statement must be refused, got {other:?}"),
+    }
+
+    // A truncated payload: the type block promises a value that is not there.
+    let mut truncated = execute_payload(statement, &[Param::Int(1)], true, 0x00, 1);
+    truncated.truncate(truncated.len() - 4);
+    match client.execute_raw(&truncated).await {
+        Response::Err { code, .. } => assert_eq!(code, 1210),
+        other => panic!("a truncated payload must be refused, got {other:?}"),
+    }
+
+    // No type block and no previous execute to reuse.
+    let mut no_types = execute_payload(statement, &[Param::Int(1)], false, 0x00, 1);
+    no_types.truncate(no_types.len() - 8);
+    match client.execute_raw(&no_types).await {
+        Response::Err { code, .. } => assert_eq!(code, 1210),
+        other => panic!("a type block is required on the first execute, got {other:?}"),
+    }
+
+    // An iteration count other than 1.
+    match client
+        .execute_raw(&execute_payload(statement, &[Param::Int(1)], true, 0x00, 2))
+        .await
+    {
+        Response::Err { code, .. } => assert_eq!(code, 1210),
+        other => panic!("a bad iteration count must be refused, got {other:?}"),
+    }
+
+    // A cursor request is refused rather than half-opened.
+    match client
+        .execute_raw(&execute_payload(statement, &[Param::Int(1)], true, 0x01, 1))
+        .await
+    {
+        Response::Err { code, .. } => assert_eq!(code, 1295),
+        other => panic!("a cursor request must be refused, got {other:?}"),
+    }
+
+    // The session is still usable afterwards.
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(1)], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["admin".to_string()]]);
+    client.close_statement(statement).await;
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stmt_reset_and_close_clear_statement_state() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, _) = client
+        .prepare("SELECT username FROM app_prod.users WHERE id = ?")
+        .await;
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(1)], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["admin".to_string()]]);
+
+    // `COM_STMT_RESET` discards the cached parameter types, so a execute that
+    // reuses them must now be refused instead of binding stale types.
+    client.reset_statement(statement).await;
+    let mut reuse = execute_payload(statement, &[Param::Int(2)], false, 0x00, 1);
+    reuse.truncate(reuse.len() - 8);
+    match client.execute_raw(&reuse).await {
+        Response::Err { code, .. } => assert_eq!(code, 1210),
+        other => panic!("reset must clear the type cache, got {other:?}"),
+    }
+    // Sending the types again works.
+    let (_, rows) = client
+        .execute(statement, &[Param::Int(2)], true)
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["alice".to_string()]]);
+
+    // After `COM_STMT_CLOSE` the id is unknown.
+    client.close_statement(statement).await;
+    match client.execute(statement, &[Param::Int(1)], true).await {
+        Response::Err { code, .. } => assert_eq!(code, 1243),
+        other => panic!("a closed statement must be unknown, got {other:?}"),
+    }
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_dml_reports_affected_rows_and_audits_the_bound_values() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (statement, parameters) = client
+        .prepare("UPDATE app_prod.users SET role = ? WHERE id = ?")
+        .await;
+    assert_eq!(parameters, 2);
+    let affected = client
+        .execute(
+            statement,
+            &[Param::Str("auditor".to_string()), Param::Int(2)],
+            true,
+        )
+        .await
+        .expect_ok();
+    assert_eq!(affected, 1);
+    client.close_statement(statement).await;
+
+    // The change is visible to the session that made it.
+    let (_, rows) = client
+        .query("SELECT role FROM app_prod.users WHERE id = 2")
+        .await
+        .expect_result();
+    assert_eq!(rows, vec![vec!["auditor".to_string()]]);
+    honeypot.stop().await;
+
+    // The audit row carries the statement with the bound values rendered in, so
+    // the record matches what actually executed.
+    let database = honeypot.open_database();
+    let recorded: String = database
+        .query_row(
+            "SELECT sql_text FROM queries WHERE sql_text LIKE '%app_prod.users%' \
+             AND query_type = 'UPDATE' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("audit row");
+    assert!(
+        recorded.contains("'auditor'"),
+        "the bound value must appear in the audit row: {recorded}"
+    );
+    assert!(
+        recorded.contains('2'),
+        "the bound key must appear in the audit row: {recorded}"
+    );
     drop(database);
     honeypot.cleanup();
 }

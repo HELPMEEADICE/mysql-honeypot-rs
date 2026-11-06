@@ -446,6 +446,19 @@ def _first_value(rows):
     return row
 
 
+def _auth_timeout(ctx):
+    """A socket timeout that always covers the configured authentication delay.
+
+    `connection_timeout` is also the socket's read timeout in
+    mysql.connector, and the honeypot deliberately stalls each login for up to
+    `delay_max`. A timeout shorter than that window turns a correct 5.9s delay
+    into a spurious `ReadTimeoutError`, so every connector connect derives its
+    timeout from the window the run was configured with.
+    """
+    # mysql.connector requires a positive *integer* number of seconds here.
+    return int(max(CONNECT_TIMEOUT, float(getattr(ctx, "delay_max", CONNECT_TIMEOUT)) + 10.0))
+
+
 def _probe_alive(ctx, retries=1, label="liveness"):
     """pymysql connect + SELECT 1; returns (ok, detail)."""
     last = "not attempted"
@@ -524,7 +537,8 @@ def check_2_mysql_connector_any_credentials(ctx):
                 port=ctx.port,
                 user=user,
                 password=password,
-                connection_timeout=CONNECT_TIMEOUT,
+                connection_timeout=_auth_timeout(ctx),
+                read_timeout=_auth_timeout(ctx),
             )
             kwargs.update(extra)          # never force sql_mode, never use prepared cursors
             try:
@@ -1082,11 +1096,39 @@ def _candidate_ips(ctx):
     return ordered
 
 
+def _wait_for_log_settled(path, timeout=5.0):
+    """Wait until the writer's row counts stop moving.
+
+    The audit database is written asynchronously by design (network tasks only
+    push onto a bounded queue), so a check that reads it immediately after the
+    last `SELECT 1` can observe a partially flushed log. Polling until two
+    consecutive samples agree is the cheapest way to audit a quiescent database
+    without weakening anything the check asserts.
+    """
+    deadline = time.perf_counter() + timeout
+    previous = None
+    while time.perf_counter() < deadline:
+        try:
+            conn = _open_sqlite_readonly(path)
+            try:
+                tables = _table_names(conn)
+                counts = tuple(_count_rows(conn, name) for name in tables)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return
+        if counts == previous:
+            return
+        previous = counts
+        time.sleep(0.05)
+
+
 def check_10_sqlite_log_audit(ctx):
     path = ctx.db_path
     if not path or not os.path.isfile(path):
         return _result(SKIP, "log database not found: %s (nothing to audit)" % os.path.abspath(path or "."))
 
+    _wait_for_log_settled(path)
     lines, problems = [], []
     try:
         conn = _open_sqlite_readonly(path)
@@ -1226,6 +1268,98 @@ def check_10_sqlite_log_audit(ctx):
 # ==========================================================================
 # Runner
 # ==========================================================================
+
+# ==========================================================================
+# CHECK 11 - prepared statements bind real parameters
+# ==========================================================================
+def check_11_prepared_statements(ctx):
+    """The only check that exercises the binary protocol end to end.
+
+    A driver that prepares, binds and re-executes is the one client shape that
+    can tell ``?`` placeholders are really bound rather than folded to NULL: an
+    ``id = ?`` that binds nothing yields an empty result set, while a correctly
+    bound ``1`` returns ``admin``.
+    """
+    if getattr(ctx.args, "skip_connector", False):
+        return _result(SKIP, "--skip-connector given")
+    connector = _require_module("mysql.connector")
+    lines, problems = [], []
+    conn = connector.connect(
+        host=ctx.host,
+        port=ctx.port,
+        user="root",
+        password="anything",
+        connection_timeout=_auth_timeout(ctx),
+        read_timeout=_auth_timeout(ctx),
+        ssl_disabled=True,
+    )
+    try:
+        cursor = conn.cursor(prepared=True)
+        try:
+            ctx.note_sql("SELECT username FROM app_prod.users WHERE id = ?")
+            cursor.execute(
+                "SELECT username FROM app_prod.users WHERE id = %s",
+                (1,),
+            )
+            rows = cursor.fetchall()
+            lines.append("id = 1 -> %r" % (rows,))
+            if rows != [("admin",)]:
+                problems.append("binding 1 to `id = ?` returned %r, expected [('admin',)]" % (rows,))
+
+            # Re-execute the same prepared statement with another value.
+            ctx.note_sql("SELECT username FROM app_prod.users WHERE id = ? (2)")
+            cursor.execute(
+                "SELECT username FROM app_prod.users WHERE id = %s",
+                (3,),
+            )
+            rows = cursor.fetchall()
+            lines.append("id = 3 -> %r" % (rows,))
+            if rows != [("bob",)]:
+                problems.append("re-executing with 3 returned %r, expected [('bob',)]" % (rows,))
+
+            # A string parameter, and one that matches nothing.
+            ctx.note_sql("SELECT username FROM app_prod.users WHERE username = ?")
+            cursor.execute(
+                "SELECT username FROM app_prod.users WHERE username = %s",
+                ("alice",),
+            )
+            rows = cursor.fetchall()
+            lines.append("username = 'alice' -> %r" % (rows,))
+            if rows != [("alice",)]:
+                problems.append("binding a string returned %r, expected [('alice',)]" % (rows,))
+
+            ctx.note_sql("SELECT username FROM app_prod.users WHERE username = ? (miss)")
+            cursor.execute(
+                "SELECT username FROM app_prod.users WHERE username = %s",
+                ("nobody",),
+            )
+            rows = cursor.fetchall()
+            lines.append("username = 'nobody' -> %r" % (rows,))
+            if rows:
+                problems.append("a non-matching parameter returned %r" % (rows,))
+
+            # A bound string must stay data: this payload is not SQL.
+            ctx.note_sql("SELECT username FROM app_prod.users WHERE username = ? (injection)")
+            cursor.execute(
+                "SELECT username FROM app_prod.users WHERE username = %s",
+                ("' OR 1=1 -- ",),
+            )
+            rows = cursor.fetchall()
+            lines.append("injection payload -> %r" % (rows,))
+            if rows:
+                problems.append("a bound injection payload widened the predicate: %r" % (rows,))
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    lines.extend(problems)
+    return _result(FAIL if problems else PASS, lines)
 CHECKS = [
     ("pymysql accepts any credentials (3 pairs)", guarded(check_1_pymysql_any_credentials)),
     ("mysql.connector accepts any credentials", guarded(check_2_mysql_connector_any_credentials)),
@@ -1237,6 +1371,7 @@ CHECKS = [
     ("malformed packets do not kill the server", guarded(check_8_malformed_packets)),
     ("concurrent connections all succeed", guarded(check_9_concurrency)),
     ("SQLite log audit (connections/queries)", guarded(check_10_sqlite_log_audit)),
+    ("prepared statements bind real parameters", guarded(check_11_prepared_statements)),
 ]
 
 
@@ -1244,7 +1379,7 @@ def run_all(ctx, verbose=True):
     results = []
     for index, (title, func) in enumerate(CHECKS, start=1):
         if verbose:
-            _emit("[run ] %2d/10 %s" % (index, title))
+            _emit("[run ] %2d/11 %s" % (index, title))
         started = time.perf_counter()
         try:
             outcome = func(ctx)
@@ -1259,7 +1394,7 @@ def run_all(ctx, verbose=True):
         item = {"index": index, "name": title, "status": status, "detail": detail, "elapsed_s": round(elapsed, 4)}
         results.append(item)
         if verbose:
-            _emit("[%-4s] %2d/10 %-44s %6.2fs" % (status, index, title, elapsed))
+            _emit("[%-4s] %2d/11 %-44s %6.2fs" % (status, index, title, elapsed))
             for line in str(detail).splitlines():
                 _emit("        " + line)
             _emit()

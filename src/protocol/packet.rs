@@ -363,7 +363,14 @@ impl<'a> PayloadReader<'a> {
     pub fn lenenc_bytes(&mut self) -> Result<Option<&'a [u8]>> {
         match self.lenenc_int()? {
             None => Ok(None),
-            Some(len) => Ok(Some(self.take(len as usize)?)),
+            Some(len) => {
+                // `as usize` would silently truncate on a 32-bit target
+                // (ARMv7, MIPS), turning a hostile length into a shorter read
+                // than the encoder wrote; refuse instead.
+                let len = usize::try_from(len)
+                    .map_err(|_| Error::Malformed("length-encoded size is too large"))?;
+                Ok(Some(self.take(len)?))
+            }
         }
     }
 
