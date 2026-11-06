@@ -1,9 +1,9 @@
 # mysql-honeypot-rs
 
-A lightweight, low-memory **MySQL honeypot** written in Rust. It speaks the real
-MySQL wire protocol (protocol version 10, 4.1+), accepts **any** username and
-password, stalls every login by a random 2–6 seconds and records each session and
-every submitted statement into a local SQLite database.
+A lightweight **MySQL honeypot** written in Rust. It speaks the real MySQL wire
+protocol (protocol version 10, 4.1+), accepts **any** username and password,
+stalls every login by a random 2–6 seconds and records each session and every
+submitted statement into a local SQLite database.
 
 The point is to keep automation talking: scanners that only perform a handshake,
 credential stuffers that try a thousand password pairs and exploit tools that run
@@ -125,10 +125,20 @@ sqlite_path = "./honeypot.db"     # audit database
 enable_wal = true                 # WAL journaling for concurrent readers
 queue_capacity = 4096             # bounded log queue; overflow is counted, never blocks
 busy_timeout_ms = 5000            # SQLITE_BUSY wait before giving up
+retention_days = 0                # 0 = keep every row (the conservative default)
+max_size_bytes = 0                # 0 = no size cap; otherwise trim the oldest rows at startup
 
 [logging]
 level = "info"                    # trace | debug | info | warn | error
 log_queries = true                # one log line per statement (the DB always records them)
+
+[virtualdb]
+enabled = true                    # simulate writes against a per-session overlay
+max_tables = 32                   # tables one session may create
+max_rows_per_table = 1000         # rows one virtual table may hold
+max_total_rows = 2000             # rows across the whole overlay
+max_string_bytes = 1024           # bytes in one stored string value
+max_total_bytes = 65536           # bytes of overlay storage per session (64 KiB)
 ```
 
 Every value is clamped into a usable range at startup (for example a
@@ -139,15 +149,27 @@ so a bad config file cannot produce a broken listener.
 `ERROR 1045` after the same random delay, which is useful for measuring how
 tools react to a "wrong password".
 
+`[virtualdb]` bounds the stateful simulation described in section 6. Setting
+`enabled = false` makes every write a bare `OK` with no stored state at all,
+which is the cheapest possible profile; the budgets are what stop a
+`CREATE TABLE` / `INSERT` loop from growing the process, so lowering them is the
+right move on a memory-constrained host.
+
 ---
 
 ## 4. Deployment
+
+`deploy/` holds the deployment artefacts: the hardened systemd unit, the
+container configuration, and [`deploy/README.md`](deploy/README.md), which
+documents the config schema, every limit these files set and the reasoning
+behind them.
 
 ### 4.1 Binary + systemd
 
 ```bash
 sudo useradd --system --home-dir /var/lib/mysql-honeypot --shell /usr/sbin/nologin mysql-honeypot
-sudo install -d -o mysql-honeypot -g mysql-honeypot /var/lib/mysql-honeypot /etc/mysql-honeypot
+sudo install -d -m 0750 -o mysql-honeypot -g mysql-honeypot /var/lib/mysql-honeypot
+sudo install -d -m 0755 /etc/mysql-honeypot
 sudo install -m 0755 target/release/mysql-honeypot-rs /usr/local/bin/
 sudo install -m 0640 -o root -g mysql-honeypot config.toml /etc/mysql-honeypot/config.toml
 sudo install -m 0644 deploy/mysql-honeypot-rs.service /etc/systemd/system/
@@ -156,9 +178,11 @@ sudo systemctl enable --now mysql-honeypot-rs
 journalctl -u mysql-honeypot-rs -f
 ```
 
-The unit is hardened (`ProtectSystem=strict`, empty capability set, syscall
-filter, `ReadWritePaths` limited to the state directory). Port 3306 needs no
-privileges, so the service runs unprivileged end to end.
+The unit is hardened (`ProtectSystem=strict`, `ProtectProc=invisible`,
+`ProcSubset=pid`, `ProtectClock`/`ProtectHostname`/`ProtectKernelLogs`, an empty
+capability set, a `@system-service` syscall filter, and `ReadWritePaths` limited
+to the state directory). Everything it creates is owner-only (`UMask=0077`).
+Port 3306 needs no privileges, so the service runs unprivileged end to end.
 
 `SIGTERM` stops the listener, tells live sessions to close, writes their
 `disconnected_at`/`duration_ms` rows and flushes the log queue before exiting.
@@ -172,6 +196,8 @@ docker run -d --name mysql-honeypot \
   -v honeypot-data:/data \
   --read-only --tmpfs /tmp:size=8m \
   --cap-drop ALL --security-opt no-new-privileges \
+  --memory 128m --memory-swap 128m --pids-limit 256 --oom-score-adj 500 \
+  --ulimit nofile=4096:8192 \
   mysql-honeypot-rs:latest
 
 # or
@@ -182,6 +208,19 @@ docker compose logs -f
 The image runs as UID/GID `10001`, uses a read-only root filesystem, publishes
 only TCP 3306, and keeps the SQLite database on the `honeypot-data` volume at
 `/data/honeypot.db` (see `deploy/config.docker.toml`).
+
+`docker-compose.yml` pins every limit explicitly — `mem_limit` and
+`memswap_limit` both `128m` (so swap is off), `oom_score_adj: 500` (the decoy is
+reclaimed before real workloads), `pids_limit: 256`, `ulimits.nofile`
+`4096:8192`, `cap_drop: ALL`, `no-new-privileges`, bounded `json-file` logging
+and `stop_grace_period: 20s` — twice the 10 s drain window that
+`deploy/config.docker.toml` asks for, so SIGTERM always finishes before Docker
+escalates to SIGKILL.
+
+The image ships no `HEALTHCHECK` on purpose: the process speaks only the MySQL
+protocol and `debian:bookworm-slim` carries no client able to probe it (`sh` is
+`dash`, without `/dev/tcp`), so a probe would be a check that never passes. Use
+an operator-side TCP check against port 3306 instead.
 
 ---
 
@@ -195,7 +234,17 @@ only TCP 3306, and keeps the SQLite database on the `honeypot-data` volume at
 | Packets | `OK`, `ERR` (with SQLSTATE), `EOF`, `AuthMoreData`, `AuthSwitchRequest`, `ColumnDefinition41`, text row |
 | Result sets | Column count → column definitions → EOF → rows → EOF, and the `CLIENT_DEPRECATE_EOF` variant |
 | Commands | `COM_QUERY`, `COM_PING`, `COM_INIT_DB`, `COM_QUIT`, `COM_STATISTICS`, `COM_PROCESS_INFO`, `COM_FIELD_LIST`, `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, `COM_SET_OPTION`, `COM_DEBUG` |
-| Refused cleanly | `COM_STMT_PREPARE` → `ERR 1295`, `COM_STMT_EXECUTE` → `ERR 1243`, unknown command → `ERR 1047` |
+| Prepared statements | `COM_STMT_PREPARE` (metadata: parameter and column definitions), `COM_STMT_EXECUTE` (binary result sets), `COM_STMT_CLOSE`, `COM_STMT_RESET`, `COM_STMT_SEND_LONG_DATA` |
+| Refused cleanly | `COM_STMT_FETCH` (no cursors) → `ERR 1295`, unknown statement handle → `ERR 1243`, unknown command → `ERR 1047` |
+
+`COM_CHANGE_USER` is handled as a real identity switch: the new login name and
+database are adopted, the session's virtual database is reset exactly as MySQL
+resets it, an `OK` packet confirms the switch, and both the `connections` row and
+a `CHANGE_USER` audit entry record it.
+
+Prepared statements answer with the binary row format (`0x00` header, NULL
+bitmap, then typed values). Numeric columns are re-typed from the actual page, so
+`SELECT COUNT(*)` through `COM_STMT_EXECUTE` returns an integer, not a string.
 
 ### 5.1 Authentication plugins
 
@@ -234,19 +283,76 @@ All catalog content lives in memory and is generated at startup.
   `SELECT table_name FROM information_schema.tables WHERE table_schema = 'app_prod'`
   returns exactly that schema's tables.
 
-Supported statements include `SELECT` (scalar expressions, arithmetic literals,
-system variables, functions such as `VERSION()`/`USER()`/`DATABASE()`/
-`CONNECTION_ID()`/`NOW()`, table projections, `COUNT(*)`, `LIMIT`), `SHOW`
-(`DATABASES`, `TABLES`, `COLUMNS`, `CREATE TABLE`, `VARIABLES`, `STATUS`,
-`PROCESSLIST`, `GRANTS`, `INDEX`, `ENGINES`, `CHARACTER SET`, `COLLATION`,
-`PRIVILEGES`, `TABLE STATUS`, `WARNINGS`), `USE`, `DESCRIBE`, `EXPLAIN`, `SET`,
-transactions, and every DML/DDL keyword — which is acknowledged with an OK packet
-and nothing else.
+`SELECT` is answered by a small expression engine, not by pattern matching:
 
-A literal `WHERE` clause is used as a coarse row filter so schema-scoped
-`information_schema` probes look right. `LOAD DATA` is answered with
-`ERR 1148`, and unknown statements get a realistic `ERR 1064` syntax error; the
-session stays open in both cases.
+* **Projections** — `*`, `table.*`, bare columns and scalar expressions, with
+  optional `AS` aliases. Up to 400 columns per result set.
+* **`WHERE`** — a column-aware parser for `=`, `!=`, `<>`, `>`, `>=`, `<`, `<=`,
+  `AND`, `OR`, `NOT`, `IN`, `LIKE`, `IS [NOT] NULL` and parentheses, with MySQL
+  comparison semantics: a number on either side compares numerically, two
+  strings compare case-insensitively, and `NULL` never matches. `LIKE` uses the
+  linear backtracking matcher, so a pathological pattern cannot blow up.
+* **Aggregates** — `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `MIN`,
+  `MAX`, `SUM`, `AVG`, optionally with `GROUP BY`. An aggregate always returns
+  exactly one row per group (empty table → `0` for `COUNT`, `NULL` otherwise) and
+  is never truncated by the row cap.
+* **Pagination** — `ORDER BY expr [ASC|DESC], ...`, `LIMIT n`, `LIMIT o, n` and
+  `LIMIT n OFFSET o`, applied in MySQL's order (filter → sort → offset → take).
+  Absurd integers saturate instead of overflowing.
+* **Functions** — `VERSION`, `DATABASE`, `USER`, `CURRENT_USER`, `CONNECTION_ID`,
+  `NOW`/`CURDATE`/`CURTIME`/`UNIX_TIMESTAMP`, `LAST_INSERT_ID`, `ROW_COUNT`,
+  `MD5`, `SHA`/`SHA1`, `SHA2` (224/256/384/512), `PASSWORD` (the MySQL 5.7
+  `*`+`SHA1(SHA1(x))` form), `LENGTH`, `CHAR_LENGTH`, `UPPER`/`LOWER`, `HEX`,
+  `ASCII`, `CONCAT`, `TRIM`, `REPLACE`, `SUBSTRING`, `LEFT`/`RIGHT`, `ABS`,
+  `ROUND`, `CEIL`, `FLOOR`, `IFNULL`, `COALESCE`, `IF`, `NULLIF`, `CAST`,
+  `SLEEP` and more. The digests are genuinely computed, so a client comparing
+  `MD5('x')` against its own result gets the same answer; `SLEEP()` returns `0`
+  immediately and never blocks a session.
+
+`CURRENT_USER()` reports the account matched by the login (`<user>@%`, which is
+exactly what the fake `mysql.user` table lists), `USER()` reports
+`<user>@<peer address>`, and `SHOW GRANTS` names the same account — so the
+identity view never contradicts itself.
+
+An expression the grammar does not cover (`BETWEEN`, `XOR`, subqueries,
+`CASE`) makes the answer *narrower*, never wider: the result set comes back empty
+and is tagged `degraded` in `queries.response_type`. Referring to a column that
+does not exist is the real `ERR 1054`; an unknown function is `ERR 1305`.
+
+`SHOW` (`DATABASES`, `TABLES`, `COLUMNS`, `CREATE TABLE`, `VARIABLES`, `STATUS`,
+`PROCESSLIST`, `GRANTS`, `INDEX`, `ENGINES`, `CHARACTER SET`, `COLLATION`,
+`PRIVILEGES`, `TABLE STATUS`, `WARNINGS`), `USE`, `DESCRIBE`, `EXPLAIN`, `SET`
+(including `SET @var = ...`) and transactions are supported as before.
+
+`LOAD DATA` is answered with `ERR 1148`, and unknown statements get a realistic
+`ERR 1064` syntax error; the session stays open in both cases.
+
+### 6.1 Stateful, session-private simulation
+
+`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` and `CREATE`/`DROP TABLE`/`DATABASE`
+really do change a virtual database — but only the caller's copy of it:
+
+```
+session A: INSERT INTO users VALUES (9001,'mallory')   -> OK, affected=1
+session A: SELECT * FROM users WHERE id = 9001        -> 1 row
+session B: SELECT * FROM users WHERE id = 9001        -> 0 rows
+session A: DROP TABLE users                           -> OK
+session A: SELECT * FROM users                        -> ERR 1146
+session B: SELECT * FROM users                        -> still 3 rows
+```
+
+The implementation is copy-on-write: a session that never writes allocates
+nothing, and the first write to a table clones exactly that table into a
+per-session overlay. `LAST_INSERT_ID()`, `ROW_COUNT()` and the affected-row
+count of every statement stay consistent with what actually happened, and
+`information_schema` (plus `SHOW TABLES` / `SHOW TABLE STATUS` / `SHOW CREATE
+TABLE`) is regenerated from the base catalog plus the overlay, so a table you
+just created really is listed.
+
+Nothing here touches a real database, the filesystem or the network: it is a
+bounded in-memory map of `String`s behind the budgets in `[virtualdb]`. Exceeding
+a budget produces the MySQL error a real server would produce (`ER_TOO_MANY_TABLES`,
+`ER_RECORD_FILE_FULL`, `ER_DATA_TOO_LONG`) rather than growing without limit.
 
 ---
 
@@ -284,6 +390,26 @@ Indexes cover `connections(source_ip)`, `connections(connected_at)`,
 `queries(connection_id)`, `queries(source_ip)`, `queries(query_type)` and
 `queries(executed_at)`.
 
+Three reliability properties are enforced by the writer:
+
+* **Lifecycle events survive a query flood.** A saturated queue drops `Query`
+  events (that is what the bound is for) but parks `CONNECT` / `IDENTIFIED` /
+  `AUTH_OK` / `DISCONNECT` in a small overflow buffer, because a lost connect row
+  would orphan every later statement from that session.
+* **Every row stands on its own.** Each write is an upsert keyed on the
+  connection id, so an identity or a query that arrives without its `CONNECT`
+  still produces a complete, attributable row instead of a lost `UPDATE`.
+* **The counters are honest.** `enqueued + dropped` is every call to `record()`,
+  and `written + failed` is every event the writer handled; a statement that
+  fails inside a batch is counted in `failed` instead of being absorbed into a
+  successful commit. The final tallies are logged when the process stops.
+
+`retention_days` and `max_size_bytes` are **off by default**: deleting forensic
+evidence should be an explicit decision. When `retention_days > 0`, rows older
+than that window are removed at startup; when `max_size_bytes > 0`, the oldest
+query rows are trimmed and the file compacted until it fits. Both operations run
+once, on the writer thread, before any session is accepted.
+
 Useful queries:
 
 ```sql
@@ -316,8 +442,20 @@ earlier rows.
 * `max_sql_length` clips stored statements on a UTF-8 boundary; the client still
   receives a normal response.
 * `handshake_timeout_seconds` and `idle_timeout_seconds` bound every wait.
-* The log queue is bounded: when the disk cannot keep up, events are dropped and
-  counted (`log queue full — dropping events`) instead of blocking sessions.
+* The log queue is bounded: when the disk cannot keep up, query events are
+  dropped and counted (`log queue full — dropping query events`) instead of
+  blocking sessions, while lifecycle events use their own overflow buffer.
+* Refusal replies are bounded too: once 32 `ERR 1040` responses are in flight, a
+  further over-limit socket is closed immediately instead of spawning a task. A
+  connection flood therefore cannot turn into an unbounded task flood.
+* Every SQL budget is explicit: 200 result rows, 400 projected columns, 512 KiB
+  of result bytes, 2 048 tokens per statement, 24 levels of expression nesting and
+  512 parser steps. Exceeding the column or row budget is reported the way MySQL
+  reports it (or silently paginated), never by allocating first.
+* The virtual database is bounded by `[virtualdb]` (table count, rows per table,
+  total rows, string length and total bytes per session).
+* `SLEEP()` and `BENCHMARK()` return immediately, so neither can be used to hold
+  a connection slot with server-side work.
 * SQLite failures (busy, disk full, corrupt handle) are retried once against a
   freshly opened connection; a batch that still fails is counted in `failed`
   rather than retried forever.
@@ -332,47 +470,62 @@ earlier rows.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
 
 * `src/**` — unit tests for framing, length-encoded integers, handshake build and
   parse, OK/ERR/EOF/result-set encoders, config clamping, statement routing,
   catalog construction, delay sampling and the SQLite writer.
 * `tests/integration.rs` — a real TCP client against a real listener on an
-  ephemeral port: arbitrary credentials, the 2–6 s window (with defaults),
+  ephemeral port: arbitrary credentials, the configured delay window,
   `SHOW DATABASES`, `SELECT 1`, long statement streams, malformed and truncated
   packets, unknown commands, concurrency, the connection limit, the
   `DEPRECATE_EOF` and `mysql_native_password` paths, `COM_PING`/`COM_INIT_DB`/
-  `COM_QUIT`, SQL truncation, and log persistence across a restart.
-* `scripts/e2e_clients.py` — end-to-end verification with **PyMySQL** and
-  **mysql-connector-python** plus a hand-written raw-protocol client:
-  10 checks covering login, delay timing, result sets, statement persistence,
-  malformed packets and concurrency, and finally auditing `honeypot.db`.
+  `COM_QUIT`, SQL truncation, log persistence across a restart, the handshake
+  timeout, and — for the SQL engine — `COUNT(*)`/`WHERE`/`LIMIT`/`ORDER BY`
+  semantics, session isolation of the virtual database, prepared statements over
+  the binary protocol, `COM_CHANGE_USER` and the logger's counters.
+* `fuzz/` — a `cargo-fuzz` crate with four targets (`packet`, `handshake`,
+  `config`, `framing`). It is a separate workspace, so `cargo build`/`test`/
+  `clippy` at the repository root are unaffected; run it with
+  `cargo +nightly fuzz run <target>`. See [`fuzz/README.md`](fuzz/README.md).
+* `scripts/bench.py` — a reproducible measurement harness for a *release* build.
+  It starts the binary on an ephemeral port with a temporary configuration and
+  reports idle RSS, RSS at 100 and 256 concurrent authenticated sessions, the
+  login-delay distribution, query throughput (single connection and 32 workers),
+  SQLite row-write throughput, database size, and behaviour under malformed
+  packets, a connection burst and abrupt disconnects. It speaks the protocol
+  directly, so it needs no driver:
+
+  ```bash
+  cargo build --release --locked
+  python scripts/bench.py            # full run
+  python scripts/bench.py --quick    # 100 sessions instead of 100 + 256
+  python scripts/bench.py --json     # machine-readable summary
+  ```
+
+  Every figure it prints is produced by that run on that machine, which is why
+  no measurement is stored in this repository.
+* `scripts/e2e_clients.py` — end-to-end verification of a *running* honeypot with
+  **PyMySQL** and **mysql-connector-python** plus a hand-written raw-protocol
+  client: 10 checks covering login, delay timing, result sets, statement
+  persistence, malformed packets and concurrency, and finally a read-only audit
+  of `honeypot.db`. It prints one PASS/FAIL/SKIP line per check, emits a single
+  JSON line with `--json`, and exits non-zero if any check fails;
+  [`scripts/README-e2e.md`](scripts/README-e2e.md) lists every check and flag.
   `python scripts/inspect_db.py` prints a read-only summary of a log database.
 
-Measured on the reference run (release build, Windows host, loopback):
+Every value that script prints belongs to the run that produced it — delays, row
+counts and timings are observations, not constants, and none of them is stored in
+this repository.
 
-```
-PASS  pymysql accepts any credentials (3 pairs)
-PASS  mysql.connector accepts any credentials
-PASS  auth delay inside [min,max] and >= 1.8s            2.97s (one probing login)
-PASS  SHOW DATABASES >= 5 rows incl. system schemas      rows=6
-PASS  SELECT 1 returns exactly 1                         row=(1,)
-PASS  SELECT VERSION()/USER()/DATABASE()                 8.0.36 / root@% / None
-PASS  5+ statements on one connection, still usable
-PASS  malformed packets do not kill the server
-PASS  concurrent connections all succeed                 5.81s vs 28.37s serial estimate
-PASS  SQLite log audit                                   both tables, every SQL, all delays in window
-PASS=10 FAIL=0
-```
-
-Observed authentication delays across runs: `2034, 2192, 2965, 3121, 3351, 3755,
-3776, 3820, 4615, 5488, 5748, 5944` ms — 23/23 logged delays inside the
-configured window, minimum 2.03 s, maximum 5.94 s. Loopback IPv6 (`::1`) was
-verified separately: the listener binds `::1`, the client connects, and
-`source_ip` is stored as `::1`.
+The delay window itself is enforced by construction: the bounds are clamped at
+startup (an inverted pair is swapped, a zero minimum becomes 1 ms), so a client
+always waits inside `[delay_min_ms, delay_max_ms]`. `server.host` accepts any IPv4
+or IPv6 literal — `::1` and `[::1]` are both valid, the brackets are stripped — so
+an IPv6-only listener is a one-line config change.
 
 ---
 
@@ -386,7 +539,7 @@ Two GitHub Actions workflows live in `.github/workflows/`:
 | --- | --- |
 | `rustfmt` | `cargo fmt --all -- --check` |
 | `clippy` | `cargo clippy --all-targets --locked -- -D warnings` |
-| `test` (ubuntu / windows / macos) | `cargo test --locked` (66 unit + 15 integration + doc tests) and a `--release` build |
+| `test` (ubuntu / windows / macos) | `cargo test --locked` (unit, integration and doc tests) and `cargo build --release --locked` |
 | `package` | `cargo package` still produces a crate archive containing `LICENSE`, `README.md`, `src/main.rs`, `src/lib.rs` |
 
 `-D warnings` is passed after `--` so it applies to this crate only; third-party
@@ -402,6 +555,10 @@ gh release create v0.1.0 --title "v0.1.0" --notes "first release"
 gh workflow run build.yml --ref main
 ```
 
+`workflow_dispatch` accepts an optional comma-separated `targets` input (matrix
+names such as `linux-mips,windows-aarch64`) to build a subset instead of all
+nine targets.
+
 | Target triple | Runner | Toolchain |
 | --- | --- | --- |
 | `x86_64-pc-windows-msvc` | windows-latest | stable, MSVC x64 dev shell |
@@ -412,7 +569,7 @@ gh workflow run build.yml --ref main
 | `aarch64-unknown-linux-gnu` | ubuntu-latest | stable + `cross` |
 | `armv7-unknown-linux-gnueabihf` | ubuntu-latest | stable + `cross` |
 | `riscv64gc-unknown-linux-gnu` | ubuntu-latest | stable + `cross` |
-| `mips-unknown-linux-gnu` | ubuntu-latest | nightly + `-Z build-std` (Tier 3: no prebuilt std) |
+| `mips-unknown-linux-gnu` | ubuntu-24.04 | nightly + `-Z build-std` (Tier 3: no prebuilt std) |
 
 Each job publishes `mysql-honeypot-rs-<version>-<triple>.tar.gz` containing the
 binary, `LICENSE`, `README.md` and `config.toml`, plus a matching `.sha256`.
@@ -445,18 +602,27 @@ default `unwind`.
 * **No TLS.** `CLIENT_SSL` is not advertised and an `SSLRequest` is refused. A
   client configured with `--ssl-mode=REQUIRED` will not connect — by design, so
   no client can believe it has an encrypted channel.
-* **No binary protocol.** `COM_STMT_PREPARE` returns `ERR 1295`, so clients that
-  insist on server-side prepared statements (some JDBC configurations, some ORMs)
-  will see an error. The statement text is still logged as `PREPARE`. Text-protocol
-  clients — the `mysql` CLI, PyMySQL, `mysql.connector`'s default cursor, most
-  scanners — are unaffected.
+* **Prepared statements ignore their parameters.** The binary protocol is
+  implemented end to end, but placeholder values are treated as `NULL`: a
+  `SELECT ... WHERE name = ?` returns no rows and the statement is logged as
+  `PREPARE`. The point is protocol compatibility, not result fidelity.
+* **Cursors are not implemented.** `COM_STMT_FETCH` answers `ERR 1295`.
 * **One statement per `COM_QUERY`.** `CLIENT_MULTI_STATEMENTS` is not advertised;
   extra statements in one payload are logged but only the first is answered.
 * **No `LOAD DATA LOCAL`, no compression.** Both capability flags stay off, so
   the honeypot can never be turned into a file transport.
-* **Static catalog.** Row counts in `information_schema` do not change in response
-  to DDL; a successful `CREATE TABLE` is not reflected in later `SHOW TABLES`.
-  This is intentional: nothing a client sends mutates the honeypot's state.
+* **Unmodelled SQL degrades to an empty result.** `BETWEEN`, `XOR`, subqueries,
+  `CASE`, `JOIN`, `UNION`, `HAVING` and `GROUP BY` over expressions the parser
+  cannot fold produce fewer rows than a real server would, never more. The
+  response is tagged `degraded` so the audit trail shows it.
+* **`SELECT ... FROM <table>` works without a database selected.** A real server
+  answers `ERR 1046`; the honeypot searches every schema so a scanner that skips
+  `USE` still sees the decoy tables. `SHOW TABLES` does require a schema, exactly
+  like MySQL.
+* **MySQL error codes are approximated.** `ER_BAD_FIELD_ERROR`, `ER_NO_SUCH_TABLE`,
+  `ER_BAD_DB_ERROR`, `ER_DATA_TOO_LONG`, `ER_RECORD_FILE_FULL` and
+  `ER_UNKNOWN_STMT_HANDLER` carry the real code, SQLSTATE and message shape, but
+  the wording is not byte-identical to a specific 8.0 point release.
 * **Connection ids on the wire are 32-bit**, so after 2^32 sessions the value
   reported by `CONNECTION_ID()` wraps while `connections.id` keeps growing.
 * **The `mysql` CLI was not available in the build environment** used for the
