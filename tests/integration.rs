@@ -398,6 +398,156 @@ impl Client {
             .expect("packet timeout")
             .expect("packet")
     }
+
+    /// `COM_STMT_PREPARE` + `COM_STMT_EXECUTE` + `COM_STMT_CLOSE`.
+    ///
+    /// The server answers `EXECUTE` with a *binary* result set, so the response
+    /// is decoded with the binary row layout rather than the text one.
+    async fn binary_query(&mut self, sql: &str) -> Response {
+        self.send_raw(&command(0x16, sql.as_bytes())).await;
+        let prepare = self.read_packet().await;
+        assert_eq!(
+            prepare[0], 0x00,
+            "COM_STMT_PREPARE must answer with COM_STMT_PREPARE_OK, got {prepare:?}"
+        );
+        let mut reader = PayloadReader::new(&prepare);
+        reader.u8().expect("header");
+        let statement_id = reader.u32le().expect("statement id");
+        let columns = reader.u16le().expect("column count");
+        let parameters = reader.u16le().expect("parameter count");
+        // Parameter definitions, then result column definitions, each block
+        // closed by an EOF unless CLIENT_DEPRECATE_EOF was negotiated.
+        for _ in 0..parameters {
+            let _ = self.read_packet().await;
+        }
+        if parameters > 0 && self.capabilities & CLIENT_DEPRECATE_EOF == 0 {
+            assert_eq!(self.read_packet().await[0], 0xfe);
+        }
+        for _ in 0..columns {
+            let _ = self.read_packet().await;
+        }
+        if columns > 0 && self.capabilities & CLIENT_DEPRECATE_EOF == 0 {
+            assert_eq!(self.read_packet().await[0], 0xfe);
+        }
+
+        let mut execute = command(0x17, &statement_id.to_le_bytes());
+        // flags, iteration count, and a null bitmap for the (unused) parameters.
+        execute.push(0x00);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        self.send_raw(&execute).await;
+        let response = self.read_binary_response().await;
+
+        // COM_STMT_CLOSE expects no reply.
+        self.send_raw(&command(0x19, &statement_id.to_le_bytes()))
+            .await;
+        response
+    }
+
+    async fn read_binary_response(&mut self) -> Response {
+        let first = self.read_packet().await;
+        if first.is_empty() {
+            return Response::Eof;
+        }
+        match first[0] {
+            0x00 => {
+                let mut reader = PayloadReader::new(&first);
+                reader.u8().expect("header");
+                let affected_rows = reader.lenenc_int().expect("affected").unwrap_or(0);
+                Response::Ok { affected_rows }
+            }
+            0xff => {
+                let mut reader = PayloadReader::new(&first);
+                reader.u8().expect("header");
+                let code = reader.u16le().expect("code");
+                let mut sqlstate = String::new();
+                if !reader.is_empty() {
+                    let marker = reader.u8().expect("marker");
+                    if marker == b'#' {
+                        sqlstate =
+                            String::from_utf8_lossy(reader.take(5).expect("state")).into_owned();
+                    }
+                }
+                let message = String::from_utf8_lossy(reader.rest()).into_owned();
+                Response::Err {
+                    code,
+                    sqlstate,
+                    message,
+                }
+            }
+            _ => {
+                let mut reader = PayloadReader::new(&first);
+                let count = reader.lenenc_int().expect("column count").unwrap_or(0) as usize;
+                let mut names = Vec::with_capacity(count);
+                let mut types = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let definition = self.read_packet().await;
+                    let mut reader = PayloadReader::new(&definition);
+                    let _catalog = reader.lenenc_str().expect("catalog");
+                    let _schema = reader.lenenc_str().expect("schema");
+                    let _table = reader.lenenc_str().expect("table");
+                    let _org_table = reader.lenenc_str().expect("org table");
+                    let name = reader.lenenc_str().expect("name").unwrap_or_default();
+                    let _org_name = reader.lenenc_str().expect("org name");
+                    let _fixed = reader.lenenc_int().expect("fixed length");
+                    let _charset = reader.u16le().expect("charset");
+                    let _length = reader.u32le().expect("length");
+                    let wire_type = reader.u8().expect("column type");
+                    names.push(name);
+                    types.push(wire_type);
+                }
+                if self.capabilities & CLIENT_DEPRECATE_EOF == 0 {
+                    assert_eq!(self.read_packet().await[0], 0xfe);
+                }
+                let mut rows = Vec::new();
+                loop {
+                    let packet = self.read_packet().await;
+                    if packet.is_empty() {
+                        continue;
+                    }
+                    if packet[0] == 0xfe && packet.len() < 9 {
+                        break;
+                    }
+                    assert_eq!(packet[0], 0x00, "binary row header");
+                    let bitmap_len = (count + 7 + 2) / 8;
+                    let bitmap = &packet[1..1 + bitmap_len];
+                    let mut reader = PayloadReader::new(&packet[1 + bitmap_len..]);
+                    let mut values = Vec::with_capacity(count);
+                    for index in 0..count {
+                        let position = index + 2;
+                        let is_null = bitmap[position / 8] & (1 << (position % 8)) != 0;
+                        if is_null {
+                            values.push(String::new());
+                            continue;
+                        }
+                        // Numeric columns are re-typed at execute time, so the
+                        // binary payload is decoded per the definition we just
+                        // read rather than assumed to be text.
+                        let value = match types.get(index).copied().unwrap_or(0xfd) {
+                            0x08 => {
+                                let raw = reader.take(8).expect("int64");
+                                let mut bytes = [0u8; 8];
+                                bytes.copy_from_slice(raw);
+                                i64::from_le_bytes(bytes).to_string()
+                            }
+                            0x05 => {
+                                let raw = reader.take(8).expect("float64");
+                                let mut bytes = [0u8; 8];
+                                bytes.copy_from_slice(raw);
+                                f64::from_le_bytes(bytes).to_string()
+                            }
+                            _ => reader.lenenc_str().expect("value").unwrap_or_default(),
+                        };
+                        values.push(value);
+                    }
+                    rows.push(values);
+                }
+                Response::ResultSet {
+                    columns: names,
+                    rows,
+                }
+            }
+        }
+    }
 }
 
 fn command(command_byte: u8, body: &[u8]) -> Vec<u8> {
@@ -1166,4 +1316,270 @@ impl ExpectRows for Response {
             other => panic!("expected a result set, got {other:?}"),
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_semantics_over_the_wire() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    // COUNT(*) is one row, one column, aliased like MySQL reports it.
+    let (columns, rows) = client
+        .query("SELECT COUNT(*) AS total FROM users")
+        .await
+        .expect_result();
+    assert_eq!(columns, vec!["total".to_string()]);
+    assert_eq!(rows.len(), 1, "an aggregate must yield exactly one row");
+    assert_eq!(rows[0][0], "3");
+
+    // A filter that matches the named column returns exactly that row.
+    let (_, rows) = client
+        .query("SELECT username FROM users WHERE username = 'admin'")
+        .await
+        .expect_result();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "admin");
+
+    // A user that does not exist returns nothing at all.
+    let (_, rows) = client
+        .query("SELECT username FROM users WHERE username = 'no-such-user'")
+        .await
+        .expect_result();
+    assert!(rows.is_empty(), "got {rows:?}");
+
+    // `admin` appears in `email` too; the filter must still be column aware.
+    let (_, rows) = client
+        .query("SELECT username FROM users WHERE email = 'admin'")
+        .await
+        .expect_result();
+    assert!(rows.is_empty(), "got {rows:?}");
+
+    // COUNT after a filter counts the filtered set.
+    let (_, rows) = client
+        .query("SELECT COUNT(*) FROM users WHERE role = 'user'")
+        .await
+        .expect_result();
+    assert_eq!(rows[0][0], "2");
+
+    // The two LIMIT spellings must paginate identically.
+    let (_, first) = client
+        .query("SELECT id FROM users ORDER BY id ASC LIMIT 1, 2")
+        .await
+        .expect_result();
+    let (_, second) = client
+        .query("SELECT id FROM users ORDER BY id ASC LIMIT 2 OFFSET 1")
+        .await
+        .expect_result();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0][0], "2");
+
+    // ORDER BY ... DESC LIMIT
+    let (_, rows) = client
+        .query("SELECT id FROM users ORDER BY id DESC LIMIT 2")
+        .await
+        .expect_result();
+    assert_eq!(rows[0][0], "3");
+
+    // A condition the evaluator cannot model must not widen the result.
+    let (_, rows) = client
+        .query("SELECT * FROM users WHERE id LIKE '1%'")
+        .await
+        .expect_result();
+    assert!(rows.len() <= 1, "got {rows:?}");
+
+    // An unknown column is the MySQL error, not an empty answer.
+    match client.query("SELECT * FROM users WHERE nope = 'x'").await {
+        Response::Err { code, .. } => assert_eq!(code, 1054),
+        other => panic!("expected ER_BAD_FIELD_ERROR, got {other:?}"),
+    }
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn virtual_database_state_is_isolated_per_session() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut first = honeypot.client_with("mallory", None).await;
+    let mut second = honeypot.client_with("victim", None).await;
+    // `SHOW TABLES` needs a schema, exactly like a real server does.
+    assert!(matches!(
+        first.query("USE app_prod").await,
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        second.query("USE app_prod").await,
+        Response::Ok { .. }
+    ));
+
+    assert_eq!(
+        first
+            .query("INSERT INTO users (id, username, role) VALUES (9001, 'mallory', 'admin')")
+            .await
+            .expect_ok(),
+        1
+    );
+    let (_, rows) = first
+        .query("SELECT username FROM users WHERE id = 9001")
+        .await
+        .expect_result();
+    assert_eq!(rows.len(), 1, "the writer must read its own insert back");
+    assert_eq!(rows[0][0], "mallory");
+
+    let (_, rows) = second
+        .query("SELECT username FROM users WHERE id = 9001")
+        .await
+        .expect_result();
+    assert!(rows.is_empty(), "another session must not see it: {rows:?}");
+
+    // A drop in one session must not take the table away from the other.
+    assert!(matches!(
+        first.query("DROP TABLE users").await,
+        Response::Ok { .. }
+    ));
+    match first.query("SELECT * FROM users").await {
+        Response::Err { code, .. } => assert_eq!(code, 1146),
+        other => panic!("expected ER_NO_SUCH_TABLE, got {other:?}"),
+    }
+    let (_, rows) = second.query("SELECT * FROM users").await.expect_result();
+    assert_eq!(rows.len(), 3, "the other session keeps its own view");
+
+    // CREATE TABLE is visible in SHOW TABLES and in information_schema.
+    assert!(matches!(
+        first
+            .query(
+                "CREATE TABLE loot (id int NOT NULL AUTO_INCREMENT PRIMARY KEY, note varchar(32))"
+            )
+            .await,
+        Response::Ok { .. }
+    ));
+    let (_, rows) = first.query("SHOW TABLES").await.expect_result();
+    let names: Vec<String> = rows.into_iter().map(|row| row[0].clone()).collect();
+    assert!(names.contains(&"loot".to_string()), "got {names:?}");
+    let (_, rows) = second.query("SHOW TABLES").await.expect_result();
+    let names: Vec<String> = rows.into_iter().map(|row| row[0].clone()).collect();
+    assert!(!names.contains(&"loot".to_string()), "got {names:?}");
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_statements_answer_with_the_binary_protocol() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+
+    let (columns, rows) = client
+        .binary_query("SELECT COUNT(*) FROM users")
+        .await
+        .expect_result();
+    assert_eq!(columns, vec!["COUNT(*)".to_string()]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "3");
+
+    let (columns, rows) = client
+        .binary_query("SELECT username FROM users WHERE username = 'admin'")
+        .await
+        .expect_result();
+    assert_eq!(columns, vec!["username".to_string()]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "admin");
+
+    // An unknown statement handle is the documented error, and the session
+    // survives it.
+    match client.send_command(0x17, &[0xff, 0xff, 0xff, 0xff]).await {
+        Response::Err { code, .. } => assert_eq!(code, 1243),
+        other => panic!("expected ER_UNKNOWN_STMT_HANDLER, got {other:?}"),
+    }
+    let (_, rows) = client.query("SELECT 1").await.expect_result();
+    assert_eq!(rows[0][0], "1");
+
+    honeypot.stop().await;
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_user_switches_identity_and_is_audited() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client_with("root", None).await;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(b"alice\0");
+    body.push(0); // empty auth response
+    body.extend_from_slice(b"mysql\0");
+    body.extend_from_slice(&45u16.to_le_bytes());
+    body.extend_from_slice(b"caching_sha2_password\0");
+    assert!(matches!(
+        client.send_command(0x11, &body).await,
+        Response::Ok { .. }
+    ));
+
+    let (_, rows) = client.query("SELECT CURRENT_USER()").await.expect_result();
+    assert_eq!(rows[0][0], "alice@%");
+    let (_, rows) = client.query("SELECT DATABASE()").await.expect_result();
+    assert_eq!(rows[0][0], "mysql");
+
+    honeypot.stop().await;
+    let database = honeypot.open_database();
+    let username: String = database
+        .query_row(
+            "SELECT username FROM connections ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("connection row");
+    assert_eq!(
+        username, "alice",
+        "the connection row must name the identity in use"
+    );
+    let switches: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM queries WHERE query_type = 'CHANGE_USER'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(switches, 1, "the switch itself must be audited");
+    drop(database);
+    honeypot.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_counters_account_for_every_event() {
+    let mut honeypot = TestHoneypot::start(base_config()).await;
+    let mut client = honeypot.client().await;
+    for sql in ["SELECT 1", "SHOW DATABASES", "SELECT COUNT(*) FROM users"] {
+        client.query(sql).await;
+    }
+    honeypot.stop().await;
+
+    let stats = honeypot.logger.stats();
+    assert_eq!(
+        stats.offered(),
+        stats.enqueued + stats.dropped,
+        "record() calls must be fully accounted: {stats:?}"
+    );
+    assert_eq!(
+        stats.enqueued,
+        stats.written + stats.failed,
+        "every queued event is committed or counted as failed: {stats:?}"
+    );
+    assert_eq!(stats.pending(), 0, "nothing may stay in flight: {stats:?}");
+    assert_eq!(stats.dropped, 0, "{stats:?}");
+    assert_eq!(stats.failed, 0, "{stats:?}");
+    // connect + identified + authenticated + 3 queries + disconnect
+    assert_eq!(stats.written, 7, "{stats:?}");
+
+    let database = honeypot.open_database();
+    let queries: i64 = database
+        .query_row("SELECT COUNT(*) FROM queries", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(queries, 3);
+    let connections: i64 = database
+        .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(connections, 1);
+    drop(database);
+    honeypot.cleanup();
 }

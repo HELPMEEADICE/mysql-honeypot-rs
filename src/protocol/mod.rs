@@ -79,7 +79,10 @@ pub const COM_PING: u8 = 0x0e;
 pub const COM_CHANGE_USER: u8 = 0x11;
 pub const COM_STMT_PREPARE: u8 = 0x16;
 pub const COM_STMT_EXECUTE: u8 = 0x17;
+pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
+pub const COM_STMT_RESET: u8 = 0x1a;
+pub const COM_STMT_FETCH: u8 = 0x1c;
 pub const COM_SET_OPTION: u8 = 0x1b;
 pub const COM_RESET_CONNECTION: u8 = 0x1f;
 

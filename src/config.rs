@@ -22,6 +22,7 @@ pub struct Config {
     pub authentication: AuthConfig,
     pub database: DatabaseConfig,
     pub logging: LoggingConfig,
+    pub virtualdb: VirtualDbConfig,
 }
 
 /// `[server]`
@@ -99,6 +100,12 @@ pub struct DatabaseConfig {
     pub queue_capacity: usize,
     /// SQLite busy timeout in milliseconds.
     pub busy_timeout_ms: u64,
+    /// Delete audit rows older than this many days at startup. `0` keeps every
+    /// row, which is the conservative default for forensic evidence.
+    pub retention_days: u32,
+    /// Ask SQLite to checkpoint the WAL once the database exceeds this many
+    /// bytes. `0` disables the size cap.
+    pub max_size_bytes: u64,
 }
 
 impl Default for DatabaseConfig {
@@ -108,6 +115,62 @@ impl Default for DatabaseConfig {
             enable_wal: true,
             queue_capacity: 4_096,
             busy_timeout_ms: 5_000,
+            retention_days: 0,
+            max_size_bytes: 0,
+        }
+    }
+}
+
+/// `[virtualdb]`
+///
+/// Budgets for the per-session copy-on-write catalog. They exist so a client
+/// that loops on `CREATE TABLE` / `INSERT` cannot grow the process without
+/// bound; the defaults keep a session's overlay well under a megabyte.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VirtualDbConfig {
+    /// Simulate `INSERT`/`UPDATE`/`DELETE`/DDL against a per-session overlay.
+    /// With `false` every write is answered with OK and no state is kept, which
+    /// is the cheapest possible mode.
+    pub enabled: bool,
+    /// Maximum tables a session may create (or clone through a write).
+    pub max_tables: usize,
+    /// Maximum rows one virtual table may hold.
+    pub max_rows_per_table: usize,
+    /// Maximum rows across the whole session overlay.
+    pub max_total_rows: usize,
+    /// Maximum bytes in one stored string value.
+    pub max_string_bytes: usize,
+    /// Maximum bytes of overlay storage per session.
+    pub max_total_bytes: usize,
+}
+
+impl Default for VirtualDbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tables: 32,
+            max_rows_per_table: 1_000,
+            max_total_rows: 2_000,
+            max_string_bytes: 1_024,
+            // 64 KiB per session × 256 sessions = 16 MiB worst case, which fits
+            // comfortably inside the container's 128 MiB budget.
+            max_total_bytes: 64 * 1_024,
+        }
+    }
+}
+
+impl VirtualDbConfig {
+    /// Convert to the budgets the state layer enforces.
+    pub fn budgets(&self) -> crate::fakedb::StateBudgets {
+        crate::fakedb::StateBudgets {
+            enabled: self.enabled,
+            max_tables: self.max_tables,
+            max_rows_per_table: self.max_rows_per_table,
+            max_total_rows: self.max_total_rows,
+            max_string_bytes: self.max_string_bytes,
+            max_total_bytes: self.max_total_bytes,
+            max_user_variables: 64,
         }
     }
 }
@@ -212,6 +275,17 @@ impl Config {
         }
         self.database.queue_capacity = self.database.queue_capacity.clamp(16, 1_048_576);
         self.database.busy_timeout_ms = self.database.busy_timeout_ms.clamp(50, 60_000);
+        self.database.retention_days = self.database.retention_days.min(3_650);
+
+        self.virtualdb.max_tables = self.virtualdb.max_tables.clamp(1, 256);
+        self.virtualdb.max_rows_per_table = self.virtualdb.max_rows_per_table.clamp(1, 100_000);
+        self.virtualdb.max_total_rows = self
+            .virtualdb
+            .max_total_rows
+            .clamp(self.virtualdb.max_rows_per_table, 1_000_000);
+        self.virtualdb.max_string_bytes = self.virtualdb.max_string_bytes.clamp(16, 1_048_576);
+        self.virtualdb.max_total_bytes =
+            self.virtualdb.max_total_bytes.clamp(4_096, 64 * 1_048_576);
 
         if self.logging.level.trim().is_empty() {
             self.logging.level = LoggingConfig::default().level;
@@ -322,6 +396,35 @@ log_queries = false
     fn missing_file_yields_defaults() {
         let config = Config::load(Path::new("definitely-not-here.toml")).expect("defaults");
         assert_eq!(config.server.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn every_shipped_config_file_parses() {
+        // `deny_unknown_fields` means a stale key in a shipped file is a startup
+        // error, so the two files the project distributes must always parse.
+        for path in ["config.toml", "deploy/config.docker.toml"] {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+            let config = Config::from_toml(&text)
+                .unwrap_or_else(|err| panic!("{path} does not match the schema: {err}"));
+            assert_eq!(config.server.port, 3306, "{path}");
+            assert!(config.authentication.always_accept, "{path}");
+        }
+    }
+
+    #[test]
+    fn virtualdb_budgets_are_clamped_into_a_usable_range() {
+        let config = Config::from_toml(
+            "[virtualdb]\nmax_tables = 0\nmax_rows_per_table = 0\nmax_total_rows = 1\nmax_total_bytes = 1\n",
+        )
+        .expect("parse");
+        assert_eq!(config.virtualdb.max_tables, 1);
+        assert_eq!(config.virtualdb.max_rows_per_table, 1);
+        assert!(config.virtualdb.max_total_rows >= config.virtualdb.max_rows_per_table);
+        assert_eq!(config.virtualdb.max_total_bytes, 4_096);
+        let budgets = config.virtualdb.budgets();
+        assert!(budgets.enabled);
+        assert_eq!(budgets.max_tables, 1);
     }
 
     #[test]

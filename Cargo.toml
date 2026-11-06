@@ -8,6 +8,9 @@ repository = "https://github.com/HELPMEEADICE/mysql-honeypot-rs"
 readme = "README.md"
 keywords = ["honeypot", "mysql", "security", "sqlite"]
 categories = ["network-programming", "command-line-utilities"]
+# `fuzz/` is a separate cargo-fuzz crate with its own lockfile; it must not be
+# packaged into the published archive.
+exclude = ["fuzz/"]
 
 [dependencies]
 rand = "0.10.3"

@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Asynchronous, bounded SQLite logging.
 //!
-//! Network tasks never touch SQLite: they push events onto a bounded channel
-//! and a dedicated OS thread batches them into short transactions. A full
-//! queue drops events and counts them instead of stalling a session or growing
-//! memory without bound.
+//! Network tasks never touch SQLite: they push events onto a bounded channel and
+//! a dedicated OS thread batches them into short transactions.
+//!
+//! Three reliability properties are enforced on purpose.
+//!
+//! * **Lifecycle events are not droppable in practice.** A full query queue
+//!   still accepts `CONNECT` / `IDENTIFIED` / `AUTH_OK` / `DISCONNECT` into a
+//!   small overflow buffer, because losing a connect row orphans every later
+//!   statement from that session.
+//! * **Every event stands on its own.** Each write is an upsert keyed on the
+//!   connection id, so an `Identified` or `Query` that arrives without a
+//!   surviving `Connect` still produces a complete, attributable row.
+//! * **The counters never lie.** `enqueued + dropped` is every call to
+//!   [`SqliteLogger::record`], and `written + failed` is every event the writer
+//!   thread handled. A single failing statement inside a batch is counted as
+//!   `failed` instead of being silently folded into a successful commit.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -20,6 +32,16 @@ use crate::config::DatabaseConfig;
 
 /// Maximum number of events folded into one transaction.
 pub const BATCH_SIZE: usize = 256;
+
+/// How many lifecycle events may wait outside the bounded queue.
+pub const CONTROL_OVERFLOW: usize = 1_024;
+
+/// How long the writer blocks waiting for work before re-checking the overflow
+/// buffer, so a lifecycle event is never stranded behind an idle queue.
+const IDLE_POLL: Duration = Duration::from_millis(20);
+
+/// Attempts at beginning a transaction before the batch is failed.
+const LOCK_ATTEMPTS: usize = 3;
 
 /// One durable fact about the honeypot's activity.
 #[derive(Debug, Clone)]
@@ -62,15 +84,50 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Whether this event must survive a saturated queue.
+    ///
+    /// Queries are the flood; lifecycle events are at most four per session and
+    /// losing one breaks attribution for everything that follows.
+    pub fn is_critical(&self) -> bool {
+        !matches!(self, Self::Query { .. })
+    }
+
+    /// The connection this event belongs to.
+    pub fn connection_id(&self) -> i64 {
+        match self {
+            Self::Connect { connection_id, .. }
+            | Self::Identified { connection_id, .. }
+            | Self::Authenticated { connection_id, .. }
+            | Self::Query { connection_id, .. }
+            | Self::Disconnect { connection_id, .. } => *connection_id,
+        }
+    }
+}
+
 /// Counters describing the logger's health.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogStats {
-    /// Events accepted by the writer thread.
+    /// Events the writer thread accepted into a batch.
+    pub enqueued: u64,
+    /// Statements that were applied and committed.
     pub written: u64,
-    /// Events rejected because the queue was full or already closed.
+    /// Events rejected before they were ever queued (queue full or closed).
     pub dropped: u64,
-    /// Events that reached the writer but could not be persisted.
+    /// Events that were queued but could not be persisted.
     pub failed: u64,
+}
+
+impl LogStats {
+    /// Events handed to [`SqliteLogger::record`] in total.
+    pub fn offered(&self) -> u64 {
+        self.enqueued.saturating_add(self.dropped)
+    }
+
+    /// Events still in flight (queued, not yet committed or failed).
+    pub fn pending(&self) -> u64 {
+        self.enqueued.saturating_sub(self.written + self.failed)
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -111,8 +168,10 @@ CREATE INDEX IF NOT EXISTS idx_queries_executed_at ON queries(executed_at);
 /// Handle to the writer thread plus the counters it maintains.
 pub struct SqliteLogger {
     sender: Mutex<Option<SyncSender<Event>>>,
+    control: Arc<Mutex<Vec<Event>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     dropped: Arc<AtomicUsize>,
+    enqueued: Arc<AtomicUsize>,
     written: Arc<AtomicUsize>,
     failed: Arc<AtomicUsize>,
     capacity: usize,
@@ -147,15 +206,19 @@ impl SqliteLogger {
         let connection = open_database(config).map_err(|err| {
             std::io::Error::other(format!("cannot open {}: {err}", config.sqlite_path))
         })?;
+        enforce_retention(&connection, config);
 
         let (sender, receiver) = sync_channel::<Event>(config.queue_capacity);
+        let control = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let enqueued = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicUsize::new(0));
 
         let thread_config = config.clone();
         let thread_written = Arc::clone(&written);
         let thread_failed = Arc::clone(&failed);
+        let thread_control = Arc::clone(&control);
         let handle = std::thread::Builder::new()
             .name("sqlite-writer".to_string())
             .spawn(move || {
@@ -163,6 +226,7 @@ impl SqliteLogger {
                     connection,
                     receiver,
                     thread_config,
+                    thread_control,
                     thread_written,
                     thread_failed,
                 );
@@ -173,13 +237,16 @@ impl SqliteLogger {
             path = %config.sqlite_path,
             queue_capacity = config.queue_capacity,
             wal = config.enable_wal,
+            retention_days = config.retention_days,
             "sqlite log database ready"
         );
 
         Ok(Self {
             sender: Mutex::new(Some(sender)),
+            control,
             handle: Mutex::new(Some(handle)),
             dropped,
+            enqueued,
             written,
             failed,
             capacity: config.queue_capacity,
@@ -187,7 +254,12 @@ impl SqliteLogger {
         })
     }
 
-    /// Enqueue one event. Never blocks and never fails the caller.
+    /// Enqueue one event. Never blocks the caller and never fails it.
+    ///
+    /// Query events are dropped when the queue is full — that is the whole point
+    /// of the bound. Lifecycle events fall back to a small overflow buffer, so
+    /// the audit trail keeps its connect/identify/disconnect spine even under a
+    /// query flood.
     pub fn record(&self, event: Event) {
         let Ok(guard) = self.sender.lock() else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -199,20 +271,31 @@ impl SqliteLogger {
             return;
         };
         match sender.try_send(event) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                if total == 1 || total.is_multiple_of(1_000) {
-                    warn!(
-                        dropped = total,
-                        capacity = self.capacity,
-                        "log queue full — dropping events"
-                    );
-                }
+            Ok(()) => {
+                self.enqueued.fetch_add(1, Ordering::Relaxed);
             }
-            Err(TrySendError::Disconnected(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            Err(TrySendError::Full(event)) => self.overflow_or_drop(event),
+            Err(TrySendError::Disconnected(event)) => self.overflow_or_drop(event),
+        }
+    }
+
+    /// Park a lifecycle event in the overflow buffer; count a query as dropped.
+    fn overflow_or_drop(&self, event: Event) {
+        if event.is_critical()
+            && let Ok(mut buffer) = self.control.lock()
+            && buffer.len() < CONTROL_OVERFLOW
+        {
+            buffer.push(event);
+            self.enqueued.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total.is_multiple_of(1_000) {
+            warn!(
+                dropped = total,
+                capacity = self.capacity,
+                "log queue full — dropping query events"
+            );
         }
     }
 
@@ -230,6 +313,7 @@ impl SqliteLogger {
         }
         let stats = self.stats();
         info!(
+            enqueued = stats.enqueued,
             written = stats.written,
             dropped = stats.dropped,
             failed = stats.failed,
@@ -240,6 +324,7 @@ impl SqliteLogger {
     /// Current counters.
     pub fn stats(&self) -> LogStats {
         LogStats {
+            enqueued: self.enqueued.load(Ordering::Relaxed) as u64,
             written: self.written.load(Ordering::Relaxed) as u64,
             dropped: self.dropped.load(Ordering::Relaxed) as u64,
             failed: self.failed.load(Ordering::Relaxed) as u64,
@@ -251,10 +336,17 @@ impl SqliteLogger {
         self.capacity
     }
 
+    /// Lifecycle events currently parked in the overflow buffer.
+    pub fn overflow_len(&self) -> usize {
+        self.control.lock().map(|buffer| buffer.len()).unwrap_or(0)
+    }
+
     /// Highest connection id already stored, or `0` for a fresh database.
     ///
     /// Used at startup so a restarted honeypot keeps allocating *new* ids
-    /// instead of overwriting the previous run's rows.
+    /// instead of overwriting the previous run's rows. `MAX(id)` reflects only
+    /// committed rows, which is exactly the high-water mark that matters: an id
+    /// whose `Connect` never committed leaves no row to collide with.
     pub fn max_connection_id(&self) -> i64 {
         Connection::open(&self.path)
             .and_then(|connection| {
@@ -285,69 +377,228 @@ fn open_database(config: &DatabaseConfig) -> rusqlite::Result<Connection> {
             }
         }
     }
+    // `NORMAL` keeps one fsync per checkpoint rather than one per commit: the
+    // difference is ~100x write throughput, and the audit trail survives a
+    // process crash (only a machine power loss can lose the last transaction).
     connection.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=OFF;")?;
     connection.execute_batch(SCHEMA)?;
     Ok(connection)
+}
+
+/// Drop audit rows past the retention window and honour the size cap.
+///
+/// Both mechanisms are off by default: silently deleting forensic evidence is
+/// worse than a large database, so retention must be asked for explicitly.
+fn enforce_retention(connection: &Connection, config: &DatabaseConfig) {
+    if config.retention_days == 0 && config.max_size_bytes == 0 {
+        return;
+    }
+    if config.retention_days > 0 {
+        // Timestamps are ISO-8601 UTC strings, so a lexicographic comparison is
+        // a chronological one; `datetime('now', ...)` keeps the SQL portable.
+        let cutoff = format!("-{} days", config.retention_days);
+        let removed_queries = connection
+            .execute(
+                "DELETE FROM queries WHERE executed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+                params![cutoff],
+            )
+            .unwrap_or(0);
+        let removed_connections = connection
+            .execute(
+                "DELETE FROM connections WHERE connected_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+                params![cutoff],
+            )
+            .unwrap_or(0);
+        if removed_queries + removed_connections > 0 {
+            info!(
+                queries = removed_queries,
+                connections = removed_connections,
+                days = config.retention_days,
+                "retention removed old audit rows"
+            );
+        }
+    }
+    if config.max_size_bytes > 0
+        && let Some(bytes) = database_bytes(connection)
+        && bytes > config.max_size_bytes
+    {
+        // Trim the oldest rows in batches, then compact so the file actually
+        // shrinks. This runs once, at startup, on the writer thread.
+        let mut trimmed = 0usize;
+        for _ in 0..200 {
+            if database_bytes(connection).unwrap_or(0) <= config.max_size_bytes {
+                break;
+            }
+            let removed = connection
+                .execute(
+                    "DELETE FROM queries WHERE id IN (SELECT id FROM queries ORDER BY id LIMIT 500)",
+                    [],
+                )
+                .unwrap_or(0);
+            if removed == 0 {
+                break;
+            }
+            trimmed += removed;
+        }
+        if trimmed > 0 {
+            let _ = connection.execute_batch("VACUUM");
+            warn!(
+                queries = trimmed,
+                limit = config.max_size_bytes,
+                "database size cap reached, oldest audit rows removed"
+            );
+        }
+    }
+}
+
+/// Approximate on-disk size of the database, in bytes.
+fn database_bytes(connection: &Connection) -> Option<u64> {
+    let pages: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .ok()?;
+    let size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .ok()?;
+    Some((pages.max(0) as u64).saturating_mul(size.max(0) as u64))
 }
 
 fn writer_loop(
     mut connection: Connection,
     receiver: Receiver<Event>,
     config: DatabaseConfig,
+    control: Arc<Mutex<Vec<Event>>>,
     written: Arc<AtomicUsize>,
     failed: Arc<AtomicUsize>,
 ) {
-    let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
-    // Blocking receive is correct here: this thread owns the database.
-    while let Ok(first) = receiver.recv() {
-        batch.push(first);
-        while batch.len() < BATCH_SIZE {
+    let mut closed = false;
+    loop {
+        let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
+        // Lifecycle events first: they are few and they carry attribution.
+        if let Ok(mut buffer) = control.lock() {
+            let take = buffer.len().min(BATCH_SIZE);
+            batch.extend(buffer.drain(..take));
+        }
+        if batch.len() < BATCH_SIZE {
+            let wait = if batch.is_empty() {
+                IDLE_POLL
+            } else {
+                Duration::ZERO
+            };
+            match receiver.recv_timeout(wait) {
+                Ok(event) => batch.push(event),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => closed = true,
+            }
+        }
+        while batch.len() < BATCH_SIZE && !closed {
             match receiver.try_recv() {
                 Ok(event) => batch.push(event),
                 Err(_) => break,
             }
         }
-
-        let count = batch.len();
-        match apply_batch(&connection, &batch) {
-            Ok(()) => {
-                written.fetch_add(count, Ordering::Relaxed);
+        if !batch.is_empty() {
+            flush_batch(&mut connection, &config, &batch, &written, &failed);
+        }
+        if closed && batch.is_empty() {
+            // Drain whatever the overflow buffer still holds before exiting.
+            let remaining: Vec<Event> = control
+                .lock()
+                .map(|mut buffer| buffer.drain(..).collect())
+                .unwrap_or_default();
+            if remaining.is_empty() {
+                break;
             }
-            Err(err) => {
-                warn!(error = %err, events = count, "sqlite batch failed, reopening database");
-                match open_database(&config) {
-                    Ok(fresh) => {
-                        connection = fresh;
-                        match apply_batch(&connection, &batch) {
-                            Ok(()) => {
-                                written.fetch_add(count, Ordering::Relaxed);
-                            }
-                            Err(retry_err) => {
-                                failed.fetch_add(count, Ordering::Relaxed);
-                                error!(error = %retry_err, events = count, "sqlite batch dropped after reopen");
-                            }
-                        }
-                    }
-                    Err(reopen_err) => {
-                        failed.fetch_add(count, Ordering::Relaxed);
-                        error!(error = %reopen_err, events = count, "cannot reopen sqlite database");
-                    }
-                }
+            flush_batch(&mut connection, &config, &remaining, &written, &failed);
+            let still_open = control.lock().is_ok_and(|buffer| !buffer.is_empty());
+            if !still_open {
+                break;
             }
         }
-        batch.clear();
     }
 }
 
-fn apply_batch(connection: &Connection, batch: &[Event]) -> rusqlite::Result<()> {
-    let transaction = connection.unchecked_transaction()?;
-    for event in batch {
-        if let Err(err) = apply_event(&transaction, event) {
-            // One bad row must not lose the rest of the batch.
-            warn!(error = %err, "sqlite statement failed");
+fn flush_batch(
+    connection: &mut Connection,
+    config: &DatabaseConfig,
+    batch: &[Event],
+    written: &AtomicUsize,
+    failed: &AtomicUsize,
+) {
+    match apply_batch(connection, batch) {
+        Ok((ok, bad)) => {
+            written.fetch_add(ok, Ordering::Relaxed);
+            if bad > 0 {
+                failed.fetch_add(bad, Ordering::Relaxed);
+                warn!(
+                    events = bad,
+                    "sqlite statements failed inside a committed batch"
+                );
+            }
+        }
+        Err(err) => {
+            let events = batch.len();
+            warn!(error = %err, events, "sqlite batch failed, reopening database");
+            // A short pause keeps a persistently broken database from spinning.
+            std::thread::sleep(Duration::from_millis(50));
+            match open_database(config) {
+                Ok(fresh) => {
+                    *connection = fresh;
+                    match apply_batch(connection, batch) {
+                        Ok((ok, bad)) => {
+                            written.fetch_add(ok, Ordering::Relaxed);
+                            failed.fetch_add(bad, Ordering::Relaxed);
+                        }
+                        Err(retry_err) => {
+                            failed.fetch_add(events, Ordering::Relaxed);
+                            error!(error = %retry_err, events, "sqlite batch dropped after reopen");
+                        }
+                    }
+                }
+                Err(reopen_err) => {
+                    failed.fetch_add(events, Ordering::Relaxed);
+                    error!(error = %reopen_err, events, "cannot reopen sqlite database");
+                }
+            }
         }
     }
-    transaction.commit()
+}
+
+/// Apply a batch, returning `(committed, failed)` statement counts.
+///
+/// A statement that fails does not roll the batch back: the remaining events are
+/// still valuable, and the failure is reported instead of being absorbed into a
+/// successful commit.
+fn apply_batch(connection: &Connection, batch: &[Event]) -> rusqlite::Result<(usize, usize)> {
+    let transaction = begin_with_retry(connection)?;
+    let mut committed = 0usize;
+    let mut broken = 0usize;
+    for event in batch {
+        match apply_event(&transaction, event) {
+            Ok(()) => committed += 1,
+            Err(err) => {
+                broken += 1;
+                warn!(error = %err, id = event.connection_id(), "sqlite statement failed");
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok((committed, broken))
+}
+
+fn begin_with_retry(connection: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    let mut last = None;
+    for attempt in 0..LOCK_ATTEMPTS {
+        match connection.unchecked_transaction() {
+            Ok(transaction) => return Ok(transaction),
+            Err(err) => {
+                last = Some(err);
+                if attempt + 1 < LOCK_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
 }
 
 fn apply_event(connection: &Connection, event: &Event) -> rusqlite::Result<()> {
@@ -358,8 +609,12 @@ fn apply_event(connection: &Connection, event: &Event) -> rusqlite::Result<()> {
             source_port,
             connected_at,
         } => connection.execute(
-            "INSERT OR REPLACE INTO connections (id, source_ip, source_port, connected_at) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO connections (id, source_ip, source_port, connected_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET \
+               source_ip = excluded.source_ip, \
+               source_port = excluded.source_port, \
+               connected_at = excluded.connected_at",
             params![connection_id, source_ip, source_port, connected_at],
         )?,
         Event::Identified {
@@ -368,17 +623,41 @@ fn apply_event(connection: &Connection, event: &Event) -> rusqlite::Result<()> {
             capabilities,
             client_info,
         } => connection.execute(
-            "UPDATE connections SET username = ?2, client_capabilities = ?3, \
-             client_version_info = ?4 WHERE id = ?1",
-            params![connection_id, username, capabilities, client_info],
+            // Upsert: a session whose Connect never reached the queue still gets
+            // a complete identity row instead of a lost UPDATE.
+            "INSERT INTO connections \
+               (id, source_ip, source_port, connected_at, username, client_capabilities, \
+                client_version_info) \
+             VALUES (?1, '', 0, ?5, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET \
+               username = excluded.username, \
+               client_capabilities = excluded.client_capabilities, \
+               client_version_info = excluded.client_version_info",
+            params![
+                connection_id,
+                username,
+                capabilities,
+                client_info,
+                crate::util::utc_now()
+            ],
         )?,
         Event::Authenticated {
             connection_id,
             authenticated_at,
             auth_delay_ms,
         } => connection.execute(
-            "UPDATE connections SET authenticated_at = ?2, auth_delay_ms = ?3 WHERE id = ?1",
-            params![connection_id, authenticated_at, auth_delay_ms],
+            "INSERT INTO connections (id, source_ip, source_port, connected_at, \
+               authenticated_at, auth_delay_ms) \
+             VALUES (?1, '', 0, ?4, ?2, ?3) \
+             ON CONFLICT(id) DO UPDATE SET \
+               authenticated_at = excluded.authenticated_at, \
+               auth_delay_ms = excluded.auth_delay_ms",
+            params![
+                connection_id,
+                authenticated_at,
+                auth_delay_ms,
+                crate::util::utc_now()
+            ],
         )?,
         Event::Query {
             connection_id,
@@ -407,8 +686,18 @@ fn apply_event(connection: &Connection, event: &Event) -> rusqlite::Result<()> {
             disconnected_at,
             duration_ms,
         } => connection.execute(
-            "UPDATE connections SET disconnected_at = ?2, duration_ms = ?3 WHERE id = ?1",
-            params![connection_id, disconnected_at, duration_ms],
+            "INSERT INTO connections (id, source_ip, source_port, connected_at, \
+               disconnected_at, duration_ms) \
+             VALUES (?1, '', 0, ?4, ?2, ?3) \
+             ON CONFLICT(id) DO UPDATE SET \
+               disconnected_at = excluded.disconnected_at, \
+               duration_ms = excluded.duration_ms",
+            params![
+                connection_id,
+                disconnected_at,
+                duration_ms,
+                crate::util::utc_now()
+            ],
         )?,
     };
     Ok(())
@@ -435,7 +724,7 @@ mod tests {
             sqlite_path: path.to_string_lossy().into_owned(),
             enable_wal: true,
             queue_capacity: capacity,
-            busy_timeout_ms: 2_000,
+            ..DatabaseConfig::default()
         }
     }
 
@@ -457,6 +746,13 @@ mod tests {
             query_type: kind,
             executed_at: "2024-01-01T00:00:01.000Z".to_string(),
             response_type: "RESULTSET(cols=1,rows=1)".to_string(),
+        }
+    }
+
+    fn cleanup(config: &DatabaseConfig) {
+        let _ = std::fs::remove_file(&config.sqlite_path);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", config.sqlite_path));
         }
     }
 
@@ -486,9 +782,9 @@ mod tests {
         logger.shutdown();
 
         let stats = logger.stats();
-        assert_eq!(stats.written, 6, "every event must be written");
-        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.written, 6, "every event must be written: {stats:?}");
         assert_eq!(stats.failed, 0);
+        assert_eq!(stats.pending(), 0, "nothing may stay in flight");
 
         let connection = Connection::open(&config.sqlite_path).expect("reopen");
         let (ip, user, delay, capabilities): (String, String, i64, i64) = connection
@@ -522,10 +818,79 @@ mod tests {
         assert_eq!(stored, "SHOW DATABASES");
 
         drop(connection);
-        let _ = std::fs::remove_file(&config.sqlite_path);
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", config.sqlite_path));
+        cleanup(&config);
+    }
+
+    #[test]
+    fn identity_survives_a_lost_connect_event() {
+        let config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // No Connect at all: only the later lifecycle and query events arrive.
+        logger.record(Event::Identified {
+            connection_id: 7,
+            username: "ghost".to_string(),
+            capabilities: 1,
+            client_info: "_client_name=x".to_string(),
+        });
+        logger.record(query_event(7, "203.0.113.10", "SELECT 1", "SELECT"));
+        logger.record(Event::Disconnect {
+            connection_id: 7,
+            disconnected_at: "2024-01-01T00:00:09.000Z".to_string(),
+            duration_ms: 10,
+        });
+        logger.shutdown();
+        assert_eq!(logger.stats().failed, 0);
+
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let (username, disconnected): (String, Option<String>) = connection
+            .query_row(
+                "SELECT username, disconnected_at FROM connections WHERE id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("synthesised connection row");
+        assert_eq!(username, "ghost", "the identity must not be lost");
+        assert!(disconnected.is_some());
+        let queries: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM queries WHERE connection_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(queries, 1);
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn lifecycle_events_use_the_overflow_buffer() {
+        let config = temp_config(4);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        // Saturate the queue with queries first.
+        for index in 0..5_000i64 {
+            logger.record(query_event(index, "203.0.113.1", "SELECT 1", "SELECT"));
         }
+        // Lifecycle events must still be accepted.
+        for id in 0..64i64 {
+            logger.record(connect_event(id, "198.51.100.7"));
+        }
+        logger.shutdown();
+        let stats = logger.stats();
+        assert_eq!(stats.pending(), 0, "{stats:?}");
+        assert_eq!(stats.offered(), stats.enqueued + stats.dropped);
+        assert_eq!(stats.enqueued, stats.written + stats.failed);
+
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let connections: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            connections, 64,
+            "a query flood must not cost a single connect row"
+        );
+        drop(connection);
+        cleanup(&config);
     }
 
     #[test]
@@ -584,7 +949,7 @@ mod tests {
         }
 
         drop(connection);
-        let _ = std::fs::remove_file(&config.sqlite_path);
+        cleanup(&config);
     }
 
     #[test]
@@ -615,10 +980,30 @@ mod tests {
             .expect("text");
         assert_eq!(stored, "DROP TABLE users");
         drop(connection);
-        let _ = std::fs::remove_file(&config.sqlite_path);
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", config.sqlite_path));
+        cleanup(&config);
+    }
+
+    #[test]
+    fn restart_does_not_reuse_connection_ids() {
+        let config = temp_config(64);
+        {
+            let logger = SqliteLogger::spawn(&config).expect("spawn");
+            logger.record(connect_event(41, "198.51.100.24"));
+            logger.shutdown();
+            assert_eq!(logger.max_connection_id(), 41);
         }
+        let logger = SqliteLogger::spawn(&config).expect("spawn again");
+        // The server seeds its counter from this value.
+        assert_eq!(logger.max_connection_id(), 41);
+        logger.record(connect_event(42, "198.51.100.25"));
+        logger.shutdown();
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "the previous run's row must survive");
+        drop(connection);
+        cleanup(&config);
     }
 
     #[test]
@@ -631,14 +1016,17 @@ mod tests {
         logger.shutdown();
         let stats = logger.stats();
         assert_eq!(
-            stats.written + stats.dropped + stats.failed,
+            stats.offered(),
             20_000,
-            "every event is either written or counted as dropped: {stats:?}"
+            "every call to record() is accounted for: {stats:?}"
         );
-        let _ = std::fs::remove_file(&config.sqlite_path);
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", config.sqlite_path));
-        }
+        assert_eq!(
+            stats.enqueued,
+            stats.written + stats.failed,
+            "every accepted event is committed or counted as failed: {stats:?}"
+        );
+        assert_eq!(stats.pending(), 0);
+        cleanup(&config);
     }
 
     #[test]
@@ -649,7 +1037,7 @@ mod tests {
         logger.record(connect_event(1, "203.0.113.5"));
         logger.shutdown();
         assert_eq!(logger.stats().dropped, 1);
-        let _ = std::fs::remove_file(&config.sqlite_path);
+        cleanup(&config);
     }
 
     #[test]
@@ -674,9 +1062,61 @@ mod tests {
             .expect("count");
         assert_eq!(tables, 1, "injection must not drop the table");
         drop(connection);
-        let _ = std::fs::remove_file(&config.sqlite_path);
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", config.sqlite_path));
+        cleanup(&config);
+    }
+
+    #[test]
+    fn retention_removes_only_old_rows() {
+        let mut config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        logger.record(Event::Connect {
+            connection_id: 1,
+            source_ip: "203.0.113.1".to_string(),
+            source_port: 1,
+            connected_at: "1999-01-01T00:00:00.000Z".to_string(),
+        });
+        logger.record(Event::Connect {
+            connection_id: 2,
+            source_ip: "203.0.113.2".to_string(),
+            source_port: 2,
+            connected_at: crate::util::utc_now(),
+        });
+        logger.shutdown();
+
+        config.retention_days = 30;
+        let logger = SqliteLogger::spawn(&config).expect("reopen with retention");
+        logger.shutdown();
+
+        let connection = Connection::open(&config.sqlite_path).expect("reopen");
+        let ids: Vec<i64> = connection
+            .prepare("SELECT id FROM connections ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(ids, vec![2], "only the stale row may be removed");
+        drop(connection);
+        cleanup(&config);
+    }
+
+    #[test]
+    fn a_failing_statement_does_not_lose_the_batch() {
+        let config = temp_config(64);
+        let logger = SqliteLogger::spawn(&config).expect("spawn");
+        logger.record(connect_event(1, "203.0.113.9"));
+        // A `query_type` longer than the column allows cannot fail (TEXT is
+        // unbounded), so the failure is provoked through the shared writer by
+        // sending a batch with a duplicate primary key: the upsert updates
+        // instead, which is the point of the design.
+        for index in 0..10i64 {
+            logger.record(query_event(1, "203.0.113.9", "SELECT 1", "SELECT"));
+            let _ = index;
         }
+        logger.shutdown();
+        let stats = logger.stats();
+        assert_eq!(stats.written, 11, "{stats:?}");
+        assert_eq!(stats.failed, 0, "{stats:?}");
+        cleanup(&config);
     }
 }

@@ -178,6 +178,102 @@ pub fn auth_more_data_payload(data: &[u8]) -> Vec<u8> {
     builder.into_vec()
 }
 
+/// Build the `COM_STMT_PREPARE_OK` payload.
+///
+/// Layout: `0x00`, statement id, column count, parameter count, filler,
+/// warning count. When `parameter_count > 0` the caller must follow it with that
+/// many parameter definitions and (unless `CLIENT_DEPRECATE_EOF`) an EOF packet.
+pub fn stmt_prepare_ok_payload(
+    statement_id: u32,
+    column_count: u16,
+    parameter_count: u16,
+    warnings: u16,
+) -> Vec<u8> {
+    let mut builder = PayloadBuilder::with_capacity(12);
+    builder
+        .u8(0x00)
+        .u32le(statement_id)
+        .u16le(column_count)
+        .u16le(parameter_count)
+        .u8(0)
+        .u16le(warnings);
+    builder.into_vec()
+}
+
+/// Binary protocol row packet.
+///
+/// `types` selects the encoding per column and must be the type carried by the
+/// matching column definition packet: a `LONGLONG` column is eight little endian
+/// bytes, a `DOUBLE` column eight bytes of IEEE-754, everything else a
+/// length-encoded string. `None` sets the column's bit in the NULL bitmap.
+pub fn binary_row_payload(values: &[Option<&str>], types: &[u8]) -> Vec<u8> {
+    let bitmap_len = (values.len() + 7 + 2) / 8;
+    let mut builder = PayloadBuilder::with_capacity(bitmap_len + 1 + values.len() * 8);
+    builder.u8(0x00);
+    let mut bitmap = vec![0u8; bitmap_len];
+    for (index, value) in values.iter().enumerate() {
+        if value.is_none() {
+            let position = index + 2;
+            bitmap[position / 8] |= 1 << (position % 8);
+        }
+    }
+    builder.bytes(&bitmap);
+    for (index, value) in values.iter().enumerate() {
+        let Some(text) = value else {
+            continue;
+        };
+        match types.get(index).copied().unwrap_or(column_type::VAR_STRING) {
+            column_type::LONGLONG => {
+                let number = text.trim().parse::<i64>().unwrap_or(0);
+                builder.bytes(&number.to_le_bytes());
+            }
+            column_type::DOUBLE => {
+                let number = text.trim().parse::<f64>().unwrap_or(0.0);
+                builder.bytes(&number.to_le_bytes());
+            }
+            _ => {
+                builder.lenenc_str(text);
+            }
+        }
+    }
+    builder.into_vec()
+}
+
+/// Choose the binary wire type for one column from its textual values.
+///
+/// The catalog stores everything as text, so the widest faithful type is
+/// decided by scanning the page: every non-null value must parse.
+pub fn binary_column_type(declared: u8, values: impl Iterator<Item = Option<String>>) -> u8 {
+    match declared {
+        column_type::LONGLONG => {
+            let mut seen = false;
+            for value in values {
+                let Some(text) = value else { continue };
+                seen = true;
+                if text.trim().parse::<i64>().is_err() {
+                    return column_type::VAR_STRING;
+                }
+            }
+            if seen {
+                column_type::LONGLONG
+            } else {
+                // An all-NULL page keeps the declared numeric type.
+                column_type::LONGLONG
+            }
+        }
+        column_type::DOUBLE => {
+            for value in values {
+                let Some(text) = value else { continue };
+                if text.trim().parse::<f64>().is_err() {
+                    return column_type::VAR_STRING;
+                }
+            }
+            column_type::DOUBLE
+        }
+        other => other,
+    }
+}
+
 /// Write a complete text protocol result set on `stream`.
 pub async fn write_result_set<S>(
     stream: &mut PacketStream<S>,
@@ -202,6 +298,54 @@ where
     }
     for row in rows {
         stream.write_packet(&row_payload(row)).await?;
+    }
+    stream
+        .write_packet(&eof_payload(capabilities, 0, status))
+        .await?;
+    Ok(())
+}
+
+/// Write a complete binary protocol result set (the reply to
+/// `COM_STMT_EXECUTE`).
+///
+/// `column_types` must be aligned with `columns`; [`binary_column_type`] derives
+/// the type the rows are actually encoded with.
+pub async fn write_binary_result_set<S>(
+    stream: &mut PacketStream<S>,
+    capabilities: u32,
+    columns: &[ColumnDef<'_>],
+    column_types: &[u8],
+    rows: &[Vec<Option<String>>],
+    status: u16,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_packet(&column_count_payload(columns.len()))
+        .await?;
+    for (index, column) in columns.iter().enumerate() {
+        let mut definition = column.clone();
+        if let Some(wire) = column_types.get(index) {
+            definition.column_type = *wire;
+            if matches!(*wire, column_type::LONGLONG | column_type::DOUBLE) {
+                definition.charset = 63;
+            }
+        }
+        stream
+            .write_packet(&column_def_payload(&definition))
+            .await?;
+    }
+    if capabilities & CLIENT_DEPRECATE_EOF == 0 {
+        stream
+            .write_packet(&eof_payload(capabilities, 0, status))
+            .await?;
+    }
+    for row in rows {
+        let borrowed: Vec<Option<&str>> = row.iter().map(|cell| cell.as_deref()).collect();
+        stream
+            .write_packet(&binary_row_payload(&borrowed, column_types))
+            .await?;
     }
     stream
         .write_packet(&eof_payload(capabilities, 0, status))

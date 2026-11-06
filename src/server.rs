@@ -13,9 +13,9 @@ use tracing::{debug, info, warn};
 
 use crate::auth;
 use crate::config::Config;
-use crate::fakedb::{self, FakeDatabase, QueryContext, QueryResult};
+use crate::fakedb::{self, FakeDatabase, QueryContext, QueryResult, SessionState};
 use crate::protocol::handshake;
-use crate::protocol::packet::PacketStream;
+use crate::protocol::packet::{PacketStream, PayloadReader};
 use crate::protocol::response::{self, ColumnDef};
 use crate::protocol::{
     self, CHARSET_UTF8MB4, CLIENT_PROTOCOL_41, Error as ProtocolError, SERVER_CAPABILITIES,
@@ -30,6 +30,15 @@ const LOG_SQL_PREVIEW: usize = 160;
 const LOG_USERNAME_LIMIT: usize = 128;
 /// Longest client attribute string persisted.
 const LOG_CLIENT_INFO_LIMIT: usize = 512;
+/// Prepared statements one session may hold open.
+const MAX_PREPARED_STATEMENTS: usize = 32;
+/// Refusal replies that may be in flight at once.
+///
+/// Without this cap, a connection flood turns every rejected socket into a
+/// spawned task, which is a cheaper attack than exhausting the connection table.
+const MAX_REFUSAL_TASKS: usize = 32;
+/// Column payload size advertised for text columns.
+const TEXT_COLUMN_LENGTH: u32 = 1024;
 
 /// Shared state for every session.
 pub struct AppState {
@@ -40,6 +49,7 @@ pub struct AppState {
     connection_sequence: AtomicUsize,
     active_connections: AtomicUsize,
     permits: Arc<Semaphore>,
+    refusals: Arc<Semaphore>,
     /// Flipped to `true` when the listener starts shutting down, so open
     /// sessions finish, log their disconnect and release their slot.
     stop: tokio::sync::watch::Receiver<bool>,
@@ -59,6 +69,10 @@ impl AppState {
     /// Unix time the honeypot started.
     pub fn started(&self) -> SystemTime {
         self.started
+    }
+
+    fn new_state(&self) -> SessionState {
+        SessionState::new(self.config.virtualdb.budgets())
     }
 }
 
@@ -96,6 +110,7 @@ where
     let (stop_sender, stop) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         permits: Arc::new(Semaphore::new(config.server.max_connections)),
+        refusals: Arc::new(Semaphore::new(MAX_REFUSAL_TASKS)),
         database: FakeDatabase::new(&config.server.version),
         started: SystemTime::now(),
         // Continue numbering where the previous run stopped: reusing ids would
@@ -127,8 +142,23 @@ where
                                 });
                             }
                             Err(_) => {
-                                warn!(peer = %peer, limit = state.config.server.max_connections, "connection limit reached, refusing");
-                                tokio::spawn(refuse_too_many_connections(stream));
+                                // Bounded: once MAX_REFUSAL_TASKS replies are in
+                                // flight the socket is simply closed, so a flood
+                                // cannot spawn unbounded tasks.
+                                match Arc::clone(&state.refusals).try_acquire_owned() {
+                                    Ok(refusal) => {
+                                        let limit = state.config.server.max_connections;
+                                        warn!(peer = %peer, limit, "connection limit reached, refusing");
+                                        tokio::spawn(async move {
+                                            let _refusal = refusal;
+                                            refuse_too_many_connections(stream).await;
+                                        });
+                                    }
+                                    Err(_) => {
+                                        debug!(peer = %peer, "refusal budget exhausted, closing socket");
+                                        drop(stream);
+                                    }
+                                }
                             }
                         }
                     }
@@ -219,6 +249,7 @@ async fn handle_client(state: Arc<AppState>, stream: TcpStream, peer: SocketAddr
 
     let started = Instant::now();
     let mut session = Session {
+        virtual_db: state.new_state(),
         state: Arc::clone(&state),
         id: connection_id,
         source_ip: source_ip.clone(),
@@ -226,6 +257,9 @@ async fn handle_client(state: Arc<AppState>, stream: TcpStream, peer: SocketAddr
         current_db: String::new(),
         capabilities: 0,
         queries: 0,
+        prepared: Vec::new(),
+        next_statement_id: 1,
+        last_result: None,
     };
     match session.run(stream).await {
         Ok(()) => debug!(id = connection_id, "session finished"),
@@ -247,6 +281,12 @@ async fn handle_client(state: Arc<AppState>, stream: TcpStream, peer: SocketAddr
     });
 }
 
+/// One prepared statement kept for the session's lifetime.
+struct PreparedStatement {
+    id: u32,
+    sql: String,
+}
+
 /// Per-connection protocol state.
 struct Session {
     state: Arc<AppState>,
@@ -256,6 +296,12 @@ struct Session {
     current_db: String,
     capabilities: u32,
     queries: u64,
+    /// The session's copy-on-write virtual database.
+    virtual_db: SessionState,
+    prepared: Vec<PreparedStatement>,
+    next_statement_id: u32,
+    /// Response produced by the last `COM_QUERY`, written by the command loop.
+    last_result: Option<QueryResult>,
 }
 
 impl Session {
@@ -341,23 +387,32 @@ impl Session {
         self.capabilities = parsed.capabilities;
         self.username = parsed.username.clone();
         if let Some(database) = parsed.database.as_ref().filter(|name| !name.is_empty()) {
-            // Accept the requested schema blindly: refusing here would end a
-            // promising session before the attacker does anything observable.
-            self.current_db = database.clone();
+            // The catalog must never contradict itself: an unknown schema is not
+            // adopted, so `DATABASE()` stays NULL instead of naming a database
+            // that `SHOW TABLES` would then refuse to describe.
+            if self.state.database.has_schema(database, &self.virtual_db) {
+                self.current_db = database.clone();
+            } else {
+                info!(
+                    id = self.id,
+                    requested = %log_field(database, 64),
+                    "handshake named an unknown database, ignoring it"
+                );
+            }
         }
         let client_info = parsed.client_summary();
         info!(
             id = self.id,
-            username = %clip(&self.username, LOG_USERNAME_LIMIT),
-            database = %clip(&self.current_db, 64),
-            plugin = parsed.auth_plugin.as_deref().unwrap_or("-"),
+            username = %log_field(&self.username, LOG_USERNAME_LIMIT),
+            database = %log_field(&self.current_db, 64),
+            plugin = log_field(parsed.auth_plugin.as_deref().unwrap_or("-"), 64),
             "AUTH"
         );
         self.state.logger.record(Event::Identified {
             connection_id: self.id,
-            username: clip(&self.username, LOG_USERNAME_LIMIT),
+            username: log_field(&self.username, LOG_USERNAME_LIMIT),
             capabilities: i64::from(parsed.capabilities),
-            client_info: clip(&client_info, LOG_CLIENT_INFO_LIMIT),
+            client_info: log_field(&client_info, LOG_CLIENT_INFO_LIMIT),
         });
 
         // ---- the random delay trap ---------------------------------------
@@ -390,7 +445,7 @@ impl Session {
             // Comparative mode: behave like a real server with a wrong password.
             let message = format!(
                 "Access denied for user '{}'@'localhost' (using password: YES)",
-                clip(&self.username, LOG_USERNAME_LIMIT)
+                log_field(&self.username, LOG_USERNAME_LIMIT)
             );
             let payload = response::err_payload(
                 self.capabilities,
@@ -415,7 +470,7 @@ impl Session {
         }
         let ok = response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
         packets.write_packet(&ok).await?;
-        info!(id = self.id, username = %clip(&self.username, LOG_USERNAME_LIMIT), "AUTH_OK");
+        info!(id = self.id, username = %log_field(&self.username, LOG_USERNAME_LIMIT), "AUTH_OK");
         self.state.logger.record(Event::Authenticated {
             connection_id: self.id,
             authenticated_at: util::utc_now(),
@@ -481,7 +536,7 @@ impl Session {
                 }
                 protocol::COM_INIT_DB => {
                     let name = String::from_utf8_lossy(body).to_string();
-                    let known = self.state.database.has_schema(&name);
+                    let known = self.state.database.has_schema(&name, &self.virtual_db);
                     if known {
                         self.current_db = name.clone();
                     }
@@ -492,26 +547,26 @@ impl Session {
                             self.capabilities,
                             protocol::ER_BAD_DB_ERROR,
                             "42000",
-                            &format!("Unknown database '{}'", clip(&name, 64)),
+                            &format!("Unknown database '{}'", log_field(&name, 64)),
                         )
                     };
                     packets.write_packet(&payload).await?;
-                    info!(id = self.id, database = %clip(&name, 64), known, "INIT_DB");
+                    info!(id = self.id, database = %log_field(&name, 64), known, "INIT_DB");
                     self.record_query(
-                        format!("USE {}", clip(&name, 64)),
+                        format!("USE {}", log_field(&name, 64)),
                         "USE",
                         if known { "OK" } else { "ERR(1049)" },
                     );
                 }
                 protocol::COM_QUERY => {
                     let raw = String::from_utf8_lossy(body).to_string();
-                    self.execute_query(packets, &raw).await?;
+                    self.execute_query(&raw).await?;
+                    let result = self.last_result.take().unwrap_or(QueryResult::Eof);
+                    self.write_result(packets, result).await?;
                 }
                 protocol::COM_FIELD_LIST => {
-                    // Deprecated in 8.0; an empty list is the honest answer.
-                    let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
-                    packets.write_packet(&eof).await?;
-                    debug!(id = self.id, "FIELD_LIST");
+                    let table = String::from_utf8_lossy(body).to_string();
+                    self.write_field_list(packets, &table).await?;
                 }
                 protocol::COM_STATISTICS => {
                     // Raw string payload, not a result set.
@@ -523,7 +578,12 @@ impl Session {
                 }
                 protocol::COM_PROCESS_INFO => {
                     let context = self.context();
-                    let result = self.state.database.dispatch("SHOW PROCESSLIST", &context);
+                    let mut state = std::mem::take(&mut self.virtual_db);
+                    let result =
+                        self.state
+                            .database
+                            .dispatch("SHOW PROCESSLIST", &context, &mut state);
+                    self.virtual_db = state;
                     self.write_result(packets, result).await?;
                     debug!(id = self.id, "PROCESS_INFO");
                 }
@@ -537,32 +597,42 @@ impl Session {
                 }
                 protocol::COM_RESET_CONNECTION => {
                     self.current_db.clear();
+                    self.virtual_db.reset();
+                    self.prepared.clear();
                     let ok =
                         response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
                     packets.write_packet(&ok).await?;
                     debug!(id = self.id, "RESET_CONNECTION");
                 }
                 protocol::COM_CHANGE_USER => {
-                    // Parse the new user name where possible; accept regardless.
-                    let mut reader = protocol::packet::PayloadReader::new(body);
-                    if let Ok(name) = reader.nul_str()
-                        && !name.is_empty()
-                    {
-                        self.username = name;
+                    self.change_user(packets, body).await?;
+                }
+                protocol::COM_STMT_PREPARE => {
+                    self.prepare_statement(packets, body).await?;
+                }
+                protocol::COM_STMT_EXECUTE => {
+                    self.execute_prepared(packets, body).await?;
+                }
+                protocol::COM_STMT_CLOSE => {
+                    // No response is expected for a close.
+                    if let Some((id, _)) = split_statement_id(body) {
+                        self.prepared.retain(|statement| statement.id != id);
                     }
+                    debug!(id = self.id, "STMT_CLOSE");
+                }
+                protocol::COM_STMT_SEND_LONG_DATA => {
+                    // Fire and forget: no response packet, and the payload is
+                    // discarded because no statement ever needs real parameters.
+                    debug!(id = self.id, "STMT_SEND_LONG_DATA");
+                }
+                protocol::COM_STMT_RESET => {
                     let ok =
                         response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
                     packets.write_packet(&ok).await?;
-                    info!(id = self.id, username = %clip(&self.username, LOG_USERNAME_LIMIT), "CHANGE_USER");
                 }
-                protocol::COM_STMT_PREPARE => {
-                    // The binary protocol is out of scope; log the SQL anyway so
-                    // the attempt is visible in the audit trail.
-                    let raw = String::from_utf8_lossy(body).to_string();
-                    let (text, _) =
-                        util::truncate_to(&raw, self.state.config.server.max_sql_length);
-                    info!(id = self.id, sql = %preview(&text), "STMT_PREPARE unsupported");
-                    self.record_query(text, "PREPARE", "ERR(1295)");
+                protocol::COM_STMT_FETCH => {
+                    // Cursors are not implemented; say so rather than sending a
+                    // partial result the client would mis-frame.
                     let payload = response::err_payload(
                         self.capabilities,
                         protocol::ER_UNSUPPORTED_PS,
@@ -570,25 +640,6 @@ impl Session {
                         "This command is not supported in the prepared statement protocol yet",
                     );
                     packets.write_packet(&payload).await?;
-                }
-                protocol::COM_STMT_EXECUTE => {
-                    let payload = response::err_payload(
-                        self.capabilities,
-                        1243,
-                        "HY000",
-                        "Unknown prepared statement handler given to mysqld_stmt_execute",
-                    );
-                    packets.write_packet(&payload).await?;
-                }
-                protocol::COM_STMT_CLOSE => {
-                    // No response is expected for a close.
-                    debug!(id = self.id, "STMT_CLOSE");
-                }
-                0x1a => {
-                    // COM_STMT_RESET
-                    let ok =
-                        response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
-                    packets.write_packet(&ok).await?;
                 }
                 other => {
                     warn!(id = self.id, command = other, "unknown command");
@@ -604,30 +655,325 @@ impl Session {
         }
     }
 
+    /// `COM_CHANGE_USER`: adopt the new identity, database and plugin, then
+    /// confirm with an OK packet the way a real server does.
+    async fn change_user(
+        &mut self,
+        packets: &mut PacketStream<TcpStream>,
+        body: &[u8],
+    ) -> Result<(), ProtocolError> {
+        let previous_user = self.username.clone();
+        let previous_db = self.current_db.clone();
+        let mut reader = PayloadReader::new(body);
+        let new_user = reader.nul_str().unwrap_or_default();
+        // Authentication response: a one byte length followed by that many
+        // bytes. The value is never used, only skipped.
+        let auth_length = reader.u8().unwrap_or(0) as usize;
+        let _ = reader.skip(auth_length);
+        let new_db = reader.nul_str().unwrap_or_default();
+        // charset (2 bytes) then the plugin name.
+        let _ = reader.u16le();
+        let plugin = reader.nul_str().unwrap_or_default();
+
+        if !new_user.is_empty() {
+            self.username = new_user.clone();
+        }
+        // A new user gets a clean virtual database, exactly like MySQL resetting
+        // the session on `COM_CHANGE_USER`.
+        self.virtual_db.reset();
+        self.current_db.clear();
+        if !new_db.is_empty() && self.state.database.has_schema(&new_db, &self.virtual_db) {
+            self.current_db = new_db.clone();
+        }
+        self.prepared.clear();
+
+        let ok = response::ok_payload(self.capabilities, 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+        packets.write_packet(&ok).await?;
+        info!(
+            id = self.id,
+            from = %log_field(&previous_user, LOG_USERNAME_LIMIT),
+            to = %log_field(&self.username, LOG_USERNAME_LIMIT),
+            database = %log_field(&self.current_db, 64),
+            plugin = log_field(&plugin, 64),
+            "CHANGE_USER"
+        );
+        // Keep the audit trail consistent: the connections row must name the
+        // identity the session is using now, and the switch itself is recorded.
+        self.state.logger.record(Event::Identified {
+            connection_id: self.id,
+            username: log_field(&self.username, LOG_USERNAME_LIMIT),
+            capabilities: i64::from(self.capabilities),
+            client_info: "COM_CHANGE_USER".to_string(),
+        });
+        self.record_query(
+            format!(
+                "COM_CHANGE_USER {} -> {} (db {} -> {})",
+                log_field(&previous_user, 64),
+                log_field(&self.username, 64),
+                log_field(&previous_db, 64),
+                log_field(&self.current_db, 64)
+            ),
+            "CHANGE_USER",
+            "OK",
+        );
+        Ok(())
+    }
+
+    /// `COM_STMT_PREPARE`: answer with `COM_STMT_PREPARE_OK` plus parameter and
+    /// column definitions, so drivers that insist on the binary protocol work.
+    async fn prepare_statement(
+        &mut self,
+        packets: &mut PacketStream<TcpStream>,
+        body: &[u8],
+    ) -> Result<(), ProtocolError> {
+        let raw = String::from_utf8_lossy(body).to_string();
+        let (sql, truncated) = util::truncate_to(&raw, self.state.config.server.max_sql_length);
+        let parameters = count_placeholders(&sql);
+        if parameters > u16::MAX as usize {
+            let payload = response::err_payload(
+                self.capabilities,
+                protocol::ER_UNSUPPORTED_PS,
+                "HY000",
+                "Too many placeholders",
+            );
+            packets.write_packet(&payload).await?;
+            return Ok(());
+        }
+        let statement_id = self.next_statement_id;
+        self.next_statement_id = self.next_statement_id.wrapping_add(1).max(1);
+        if self.prepared.len() >= MAX_PREPARED_STATEMENTS {
+            self.prepared.remove(0);
+        }
+        self.prepared.push(PreparedStatement {
+            id: statement_id,
+            sql: sql.clone(),
+        });
+
+        // Metadata the client will read immediately after the OK packet: the
+        // parameter definitions, then one definition per result column. Both
+        // blocks are terminated by EOF unless CLIENT_DEPRECATE_EOF is set.
+        let columns = self.prepared_column_payloads(&sql);
+        let payload = response::stmt_prepare_ok_payload(
+            statement_id,
+            u16::try_from(columns.len()).unwrap_or(0),
+            parameters as u16,
+            0,
+        );
+        packets.write_packet(&payload).await?;
+        for index in 0..parameters {
+            let name = format!("?{}", index + 1);
+            let definition = ColumnDef::text("", "", &name);
+            packets
+                .write_packet(&response::column_def_payload(&definition))
+                .await?;
+        }
+        if parameters > 0 && self.capabilities & protocol::CLIENT_DEPRECATE_EOF == 0 {
+            let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
+            packets.write_packet(&eof).await?;
+        }
+        for definition in &columns {
+            packets.write_packet(definition).await?;
+        }
+        if !columns.is_empty() && self.capabilities & protocol::CLIENT_DEPRECATE_EOF == 0 {
+            let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
+            packets.write_packet(&eof).await?;
+        }
+        info!(
+            id = self.id,
+            statement_id,
+            truncated,
+            parameters,
+            columns = columns.len(),
+            sql = %preview(&sql),
+            "STMT_PREPARE"
+        );
+        self.record_query(sql, "PREPARE", "OK(statement)");
+        Ok(())
+    }
+
+    /// Column definition packets for a prepared statement.
+    ///
+    /// `COM_STMT_PREPARE_OK` is followed by one definition per result column, so
+    /// a `SELECT` has to be resolved at prepare time. Only read-only statements
+    /// are evaluated, against a scratch copy of the session state, so `PREPARE
+    /// INSERT` can never mutate anything.
+    fn prepared_column_payloads(&mut self, sql: &str) -> Vec<Vec<u8>> {
+        let kind = fakedb::classify(sql);
+        if !matches!(kind, "SELECT" | "SHOW" | "DESCRIBE" | "EXPLAIN") {
+            return Vec::new();
+        }
+        // Cheap bound: a large overlay is not copied for a metadata guess.
+        if self.virtual_db.bytes() > 64 * 1024 {
+            return Vec::new();
+        }
+        let mut scratch = self.virtual_db.clone();
+        let context = self.context();
+        match self.state.database.dispatch(sql, &context, &mut scratch) {
+            QueryResult::ResultSet(set) => {
+                let mut payloads = Vec::with_capacity(set.columns.len());
+                for (index, column) in set.columns.iter().enumerate() {
+                    let definition = column_definition(index, column, &set);
+                    payloads.push(response::column_def_payload(&definition));
+                }
+                payloads
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `COM_STMT_EXECUTE`: run the stored statement and answer with a *binary*
+    /// result set, which is what the client expects after a prepare.
+    async fn execute_prepared(
+        &mut self,
+        packets: &mut PacketStream<TcpStream>,
+        body: &[u8],
+    ) -> Result<(), ProtocolError> {
+        let Some((statement_id, _)) = split_statement_id(body) else {
+            let payload = response::err_payload(
+                self.capabilities,
+                1243,
+                "HY000",
+                "Unknown prepared statement handler given to mysqld_stmt_execute",
+            );
+            packets.write_packet(&payload).await?;
+            return Ok(());
+        };
+        let Some(sql) = self
+            .prepared
+            .iter()
+            .find(|statement| statement.id == statement_id)
+            .map(|statement| statement.sql.clone())
+        else {
+            let payload = response::err_payload(
+                self.capabilities,
+                1243,
+                "HY000",
+                "Unknown prepared statement handler given to mysqld_stmt_execute",
+            );
+            packets.write_packet(&payload).await?;
+            return Ok(());
+        };
+        self.queries += 1;
+        let query_type = fakedb::classify(&sql);
+        let context = self.context();
+        let result = self
+            .state
+            .database
+            .dispatch(&sql, &context, &mut self.virtual_db);
+        if self.state.config.logging.log_queries {
+            info!(
+                id = self.id,
+                kind = query_type,
+                sql = %preview(&sql),
+                "EXECUTE"
+            );
+        }
+        self.record_query(sql, query_type, &result.kind());
+        match result {
+            QueryResult::ResultSet(set) => {
+                let columns: Vec<ColumnDef<'_>> = set
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| column_definition(index, column, &set))
+                    .collect();
+                let types: Vec<u8> = set
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        response::binary_column_type(
+                            column.wire_type,
+                            set.rows.iter().map(|row| row.get(index).cloned().flatten()),
+                        )
+                    })
+                    .collect();
+                response::write_binary_result_set(
+                    packets,
+                    self.capabilities,
+                    &columns,
+                    &types,
+                    &set.rows,
+                    SERVER_STATUS_AUTOCOMMIT,
+                )
+                .await?;
+            }
+            other => self.write_result(packets, other).await?,
+        }
+        Ok(())
+    }
+
+    async fn write_field_list(
+        &mut self,
+        packets: &mut PacketStream<TcpStream>,
+        table: &str,
+    ) -> Result<(), ProtocolError> {
+        let context = self.context();
+        let sql = format!("SHOW COLUMNS FROM {}", log_field(table, 64));
+        let result = self
+            .state
+            .database
+            .dispatch(&sql, &context, &mut self.virtual_db);
+        match result {
+            QueryResult::ResultSet(set) if !set.rows.is_empty() => {
+                for row in &set.rows {
+                    let name = row.first().cloned().flatten().unwrap_or_default();
+                    let data_type = row.get(1).cloned().flatten().unwrap_or_default();
+                    let mut definition = ColumnDef::text("", table, &name);
+                    definition.column_type = fakedb_type_for(&data_type);
+                    packets
+                        .write_packet(&response::column_def_payload(&definition))
+                        .await?;
+                }
+                let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
+                packets.write_packet(&eof).await?;
+            }
+            QueryResult::ResultSet(_) => {
+                let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
+                packets.write_packet(&eof).await?;
+            }
+            QueryResult::Error {
+                code,
+                sqlstate,
+                message,
+            } => {
+                let payload = response::err_payload(self.capabilities, code, sqlstate, &message);
+                packets.write_packet(&payload).await?;
+            }
+            _ => {
+                let eof = response::eof_payload(self.capabilities, 0, SERVER_STATUS_AUTOCOMMIT);
+                packets.write_packet(&eof).await?;
+            }
+        }
+        debug!(id = self.id, "FIELD_LIST");
+        Ok(())
+    }
+
     fn context(&self) -> QueryContext {
         QueryContext {
             current_db: self.current_db.clone(),
             username: self.username.clone(),
+            client_host: self.source_ip.clone(),
             connection_id: self.id as u32,
             server_version: self.state.config.server.version.clone(),
         }
     }
 
-    async fn execute_query(
-        &mut self,
-        packets: &mut PacketStream<TcpStream>,
-        raw: &str,
-    ) -> Result<(), ProtocolError> {
+    /// Run one `COM_QUERY` statement and stash its response.
+    async fn execute_query(&mut self, raw: &str) -> Result<(), ProtocolError> {
         self.queries += 1;
         let limit = self.state.config.server.max_sql_length;
         let (sql_text, truncated) = util::truncate_to(raw, limit);
         let query_type = fakedb::classify(&sql_text);
         let context = self.context();
-        let result = self.state.database.dispatch(&sql_text, &context);
+        let result = self
+            .state
+            .database
+            .dispatch(&sql_text, &context, &mut self.virtual_db);
 
         // `USE` changes the session's schema, exactly like a real server.
         if let Some(name) = fakedb::use_target(&sql_text)
-            && self.state.database.has_schema(&name)
+            && self.state.database.has_schema(&name, &self.virtual_db)
         {
             self.current_db = name;
         }
@@ -642,18 +988,19 @@ impl Session {
             );
         }
         self.record_query(sql_text, query_type, &result.kind());
-        self.write_result(packets, result).await
+        self.last_result = Some(result);
+        Ok(())
     }
 
     fn record_query(&self, sql_text: String, query_type: &'static str, response_type: &str) {
         self.state.logger.record(Event::Query {
             connection_id: self.id,
             source_ip: self.source_ip.clone(),
-            username: clip(&self.username, LOG_USERNAME_LIMIT),
+            username: log_field(&self.username, LOG_USERNAME_LIMIT),
             sql_text,
             query_type,
             executed_at: util::utc_now(),
-            response_type: clip(response_type, 128),
+            response_type: log_field(response_type, 128),
         });
     }
 
@@ -681,18 +1028,8 @@ impl Session {
                 let columns: Vec<ColumnDef<'_>> = set
                     .columns
                     .iter()
-                    .map(|column| ColumnDef {
-                        schema: &column.schema,
-                        table: &column.table,
-                        org_table: &column.table,
-                        name: &column.name,
-                        org_name: &column.org_name,
-                        charset: u32::from(CHARSET_UTF8MB4) as u16,
-                        column_length: 1024,
-                        column_type: column.wire_type,
-                        flags: 0,
-                        decimals: 0,
-                    })
+                    .enumerate()
+                    .map(|(index, column)| column_definition(index, column, &set))
                     .collect();
                 response::write_result_set(
                     packets,
@@ -720,23 +1057,118 @@ impl Session {
     }
 }
 
+/// Build the wire column definition for one result column.
+///
+/// Numeric columns advertise the binary charset (63) and a realistic display
+/// width, text columns the connection charset and the widest value on the page.
+fn column_definition<'a>(
+    index: usize,
+    column: &'a crate::fakedb::ResultColumn,
+    set: &'a crate::fakedb::ResultSet,
+) -> ColumnDef<'a> {
+    let numeric = matches!(
+        column.wire_type,
+        crate::protocol::response::column_type::LONGLONG
+            | crate::protocol::response::column_type::DOUBLE
+            | crate::protocol::response::column_type::LONG
+    );
+    let (charset, length) = if numeric {
+        (63u16, 21u32)
+    } else {
+        let widest = set
+            .rows
+            .iter()
+            .filter_map(|row| row.get(index))
+            .filter_map(|cell| cell.as_ref().map(String::len))
+            .max()
+            .unwrap_or(0);
+        (
+            u32::from(CHARSET_UTF8MB4) as u16,
+            u32::try_from(widest.max(32)).unwrap_or(TEXT_COLUMN_LENGTH),
+        )
+    };
+    ColumnDef {
+        schema: &column.schema,
+        table: &column.table,
+        org_table: &column.table,
+        name: &column.name,
+        org_name: &column.org_name,
+        charset,
+        column_length: length,
+        column_type: column.wire_type,
+        flags: 0,
+        decimals: 0,
+    }
+}
+
+fn fakedb_type_for(data_type: &str) -> u8 {
+    use crate::protocol::response::column_type;
+    match data_type.split(['(', ' ']).next().unwrap_or(data_type) {
+        "int" | "integer" | "mediumint" | "smallint" | "tinyint" | "bigint" | "bit" => {
+            column_type::LONGLONG
+        }
+        "decimal" | "numeric" | "double" | "float" | "real" => column_type::DOUBLE,
+        "date" => column_type::DATE,
+        "datetime" | "timestamp" => column_type::DATETIME,
+        _ => column_type::VAR_STRING,
+    }
+}
+
+/// Read the `statement_id` from the start of a statement command payload.
+fn split_statement_id(body: &[u8]) -> Option<(u32, usize)> {
+    if body.len() < 4 {
+        return None;
+    }
+    let id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    Some((id, 4))
+}
+
+/// Count `?` placeholders outside string literals and quoted identifiers.
+fn count_placeholders(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' && quote != b'`' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == quote {
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'?' => count += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    count
+}
+
 /// UTF-8 safe clip for log and database fields.
 fn clip(text: &str, max_bytes: usize) -> String {
     util::truncate_to(text, max_bytes).0
 }
 
+/// Clip *and* neutralise control characters.
+///
+/// A username or client attribute full of newlines and ANSI escapes would
+/// otherwise let an attacker forge terminal log lines; the audit database keeps
+/// the raw bytes because the SQLite writer binds them as parameters.
+fn log_field(text: &str, max_bytes: usize) -> String {
+    fakedb::sanitise(&clip(text, max_bytes))
+}
+
 /// Collapse control characters so a hostile statement cannot forge log lines.
 fn preview(sql: &str) -> String {
-    let (text, _) = util::truncate_to(sql, LOG_SQL_PREVIEW);
-    text.chars()
-        .map(|character| {
-            if character.is_control() {
-                '.'
-            } else {
-                character
-            }
-        })
-        .collect()
+    log_field(sql, LOG_SQL_PREVIEW)
 }
 
 #[cfg(unix)]

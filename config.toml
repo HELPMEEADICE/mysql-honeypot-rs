@@ -47,3 +47,27 @@ busy_timeout_ms = 5000
 level = "info"
 # Log one line per statement received (the database always records them all).
 log_queries = true
+
+[virtualdb]
+# Simulate INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE against a
+# per-session copy-on-write catalog, so a client that writes and reads back sees
+# a consistent (and completely fake) database. Nothing ever touches a real
+# database, the filesystem or the network.
+#
+# Set to false for the absolute minimum footprint: writes are answered with OK
+# and no state is kept at all.
+enabled = true
+
+# The four budgets below bound what one session may accumulate. They are what
+# stops a CREATE TABLE / INSERT loop from growing the process without limit.
+# Maximum tables a session may create (or clone by writing to one).
+max_tables = 32
+# Maximum rows in one virtual table.
+max_rows_per_table = 1000
+# Maximum rows across the whole session overlay.
+max_total_rows = 2000
+# Maximum bytes in one stored string value.
+max_string_bytes = 1024
+# Maximum bytes of overlay storage per session (64 KiB). 256 sessions ×
+# 64 KiB bounds the whole overlay at 16 MiB even if every client writes.
+max_total_bytes = 65536

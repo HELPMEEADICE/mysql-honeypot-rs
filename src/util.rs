@@ -68,6 +68,11 @@ pub fn truncate_to(text: &str, max_bytes: usize) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
+/// Truncate to at most `max_bytes` bytes and return only the text.
+pub fn clip(text: &str, max_bytes: usize) -> String {
+    truncate_to(text, max_bytes).0
+}
+
 /// Lowercase hex encoding, used for the fake password hashes served in
 /// `mysql.user`.
 pub fn hex_lower(bytes: &[u8]) -> String {

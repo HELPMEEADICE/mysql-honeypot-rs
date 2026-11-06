@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod config;
 pub mod fakedb;
+pub mod hash;
 pub mod protocol;
 pub mod server;
 pub mod sqlite_log;
