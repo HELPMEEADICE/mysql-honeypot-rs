@@ -7,7 +7,7 @@
 //! memory without bound.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -112,9 +112,9 @@ CREATE INDEX IF NOT EXISTS idx_queries_executed_at ON queries(executed_at);
 pub struct SqliteLogger {
     sender: Mutex<Option<SyncSender<Event>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
-    dropped: Arc<AtomicU64>,
-    written: Arc<AtomicU64>,
-    failed: Arc<AtomicU64>,
+    dropped: Arc<AtomicUsize>,
+    written: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
     capacity: usize,
     path: String,
 }
@@ -149,9 +149,9 @@ impl SqliteLogger {
         })?;
 
         let (sender, receiver) = sync_channel::<Event>(config.queue_capacity);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let written = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
 
         let thread_config = config.clone();
         let thread_written = Arc::clone(&written);
@@ -240,9 +240,9 @@ impl SqliteLogger {
     /// Current counters.
     pub fn stats(&self) -> LogStats {
         LogStats {
-            written: self.written.load(Ordering::Relaxed),
-            dropped: self.dropped.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
+            written: self.written.load(Ordering::Relaxed) as u64,
+            dropped: self.dropped.load(Ordering::Relaxed) as u64,
+            failed: self.failed.load(Ordering::Relaxed) as u64,
         }
     }
 
@@ -294,8 +294,8 @@ fn writer_loop(
     mut connection: Connection,
     receiver: Receiver<Event>,
     config: DatabaseConfig,
-    written: Arc<AtomicU64>,
-    failed: Arc<AtomicU64>,
+    written: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
 ) {
     let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
     // Blocking receive is correct here: this thread owns the database.
@@ -308,7 +308,7 @@ fn writer_loop(
             }
         }
 
-        let count = batch.len() as u64;
+        let count = batch.len();
         match apply_batch(&connection, &batch) {
             Ok(()) => {
                 written.fetch_add(count, Ordering::Relaxed);

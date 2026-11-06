@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -37,8 +37,8 @@ pub struct AppState {
     logger: Arc<SqliteLogger>,
     database: FakeDatabase,
     started: SystemTime,
-    connection_sequence: AtomicU64,
-    active_connections: AtomicU64,
+    connection_sequence: AtomicUsize,
+    active_connections: AtomicUsize,
     permits: Arc<Semaphore>,
     /// Flipped to `true` when the listener starts shutting down, so open
     /// sessions finish, log their disconnect and release their slot.
@@ -53,7 +53,7 @@ impl AppState {
 
     /// Number of sessions currently open.
     pub fn active_connections(&self) -> u64 {
-        self.active_connections.load(Ordering::Relaxed)
+        self.active_connections.load(Ordering::Relaxed) as u64
     }
 
     /// Unix time the honeypot started.
@@ -100,8 +100,12 @@ where
         started: SystemTime::now(),
         // Continue numbering where the previous run stopped: reusing ids would
         // replace older rows because `id` is the primary key.
-        connection_sequence: AtomicU64::new(logger.max_connection_id().max(0) as u64 + 1),
-        active_connections: AtomicU64::new(0),
+        // `AtomicUsize` rather than `AtomicU64`: targets such as 32-bit MIPS have
+        // no 64-bit atomics, so `AtomicU64` does not even exist there.
+        connection_sequence: AtomicUsize::new(
+            (logger.max_connection_id().max(0) as usize).saturating_add(1),
+        ),
+        active_connections: AtomicUsize::new(0),
         logger,
         config,
         stop,
