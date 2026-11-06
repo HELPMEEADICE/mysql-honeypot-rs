@@ -24,3 +24,13 @@ busy_timeout_ms = 5000
 [logging]
 level = "info"
 log_queries = true
+
+[virtualdb]
+# 256 concurrent sessions × 64 KiB bounds the overlay at 16 MiB, which fits the
+# container's 128 MiB memory limit with room for the base catalog and the queue.
+enabled = true
+max_tables = 32
+max_rows_per_table = 1000
+max_total_rows = 2000
+max_string_bytes = 1024
+max_total_bytes = 65536

@@ -1,11 +1,32 @@
+# Build outputs
 target/
+
+# Local honeypot state — never bake a log database into the image
 honeypot.db
 honeypot.db-wal
 honeypot.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Local logs
 server.log
 server.err
+*.log
+
+# Not used by either build stage: `cargo build` compiles src/ only, and the
+# workflows are read by GitHub Actions, not by the image.
+tests/
+.github/
+.gitattributes
+
+# Python helpers and caches (scripts/ is not part of the image)
 scripts/__pycache__/
+**/__pycache__/
 *.pyc
+
+# VCS and editor state
 .git/
 .vscode/
 .idea/
+.DS_Store

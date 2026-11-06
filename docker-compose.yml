@@ -24,7 +24,17 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+    # ---- resource limits -------------------------------------------------
     mem_limit: 128m
+    # Swap pinned to the memory limit, so the container never pages the host
+    # and a saturated honeypot is an OOM kill instead of a slow one.
+    memswap_limit: 128m
+    # A deliberately positive score: the kernel should reclaim a saturated
+    # decoy before it touches any real workload sharing the host.
+    oom_score_adj: 500
+    # Sessions are async tasks, not threads; the only extra thread is the
+    # SQLite writer, so this caps a fork bomb without limiting connections.
     pids_limit: 256
     ulimits:
       nofile:
@@ -38,7 +48,10 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    stop_grace_period: 20s   # lets in-flight sessions flush their log rows
+    # Must stay above shutdown_grace_seconds (10 in deploy/config.docker.toml)
+    # so SIGTERM can drain live sessions and flush the log queue before Docker
+    # escalates to SIGKILL.
+    stop_grace_period: 20s
 
 volumes:
   honeypot-data:

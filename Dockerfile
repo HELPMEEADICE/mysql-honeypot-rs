@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # ---- build ---------------------------------------------------------------
+# `Cargo.toml` declares `edition = "2024"`, which needs Rust 1.85 or newer; the
+# builder is pinned to a concrete minor version so the build stays reproducible.
 FROM rust:1.90-bookworm AS builder
 
 # rusqlite is built with the `bundled` feature, so the SQLite C amalgamation is
@@ -13,8 +15,9 @@ RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs && printf '' > src/lib
     && cargo build --release --locked \
     && rm -rf src
 
+# `cargo build` compiles `src/lib.rs` and `src/main.rs` only; the integration
+# tests under `tests/` are not part of a release build and stay out of the image.
 COPY src ./src
-COPY tests ./tests
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # ---- runtime -------------------------------------------------------------
@@ -39,5 +42,10 @@ VOLUME ["/data"]
 # The honeypot's only listening socket.
 EXPOSE 3306
 
+# No HEALTHCHECK, deliberately. The process speaks the MySQL protocol and
+# nothing else, and this image ships no client that can speak it: /bin/sh is
+# dash, which has no /dev/tcp, and there is no mysql/mariadb client or netcat.
+# A container-level probe would therefore either fail permanently or need extra
+# packages, so liveness is left to an operator-side TCP check on port 3306.
 ENTRYPOINT ["/usr/local/bin/mysql-honeypot-rs"]
 CMD ["--config", "/etc/mysql-honeypot/config.toml"]

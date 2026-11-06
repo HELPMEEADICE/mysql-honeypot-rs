@@ -1,6 +1,6 @@
 [Unit]
 Description=mysql-honeypot-rs — lightweight MySQL honeypot
-Documentation=https://example.invalid/mysql-honeypot-rs
+Documentation=https://github.com/HELPMEEADICE/mysql-honeypot-rs
 After=network-online.target
 Wants=network-online.target
 
@@ -8,6 +8,10 @@ Wants=network-online.target
 Type=simple
 User=mysql-honeypot
 Group=mysql-honeypot
+
+# Everything the service creates (honeypot.db, -wal and -shm) is owner-only, so
+# captured credentials and SQL never leak to another local account.
+UMask=0077
 
 # The working directory holds honeypot.db unless sqlite_path is absolute.
 WorkingDirectory=/var/lib/mysql-honeypot
@@ -30,10 +34,15 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -45,6 +54,8 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
 # The SQLite database (and its -wal/-shm siblings) is the only writable path.
+# StateDirectory creates exactly that directory under /var/lib and grants the
+# process write access to it, so the two settings name the same path.
 ReadWritePaths=/var/lib/mysql-honeypot
 StateDirectory=mysql-honeypot
 StateDirectoryMode=0750
