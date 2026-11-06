@@ -4,6 +4,8 @@
 #   * `release: published` — every asset is attached to that GitHub release.
 #   * `workflow_dispatch`  — the same archives are published as workflow
 #                            artifacts, downloadable from the Actions run page.
+#                            The optional `targets` input narrows the matrix,
+#                            e.g. "linux-mips,windows-aarch64".
 #
 # Targets: Windows (x86_64/aarch64), macOS (x86_64/aarch64),
 #          Linux (x86_64/aarch64/armv7/riscv64/mips).
@@ -15,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "Optional comma separated subset of matrix names (e.g. linux-mips,windows-aarch64). Empty builds everything."
+        description: "Optional comma separated matrix names to build (empty = all)"
         required: false
         default: ""
 
@@ -33,69 +35,56 @@ env:
   BIN_NAME: mysql-honeypot-rs
 
 jobs:
+  # A job-level `if` cannot read the `matrix` context, so the matrix is computed
+  # here and handed to the build job as JSON.
+  plan:
+    name: Plan the matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Select the targets
+        id: matrix
+        env:
+          SELECTED: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          cat > matrix.json <<'JSON'
+          [
+            {"name":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","arch":"x64","ext":".exe"},
+            {"name":"windows-aarch64","os":"windows-latest","target":"aarch64-pc-windows-msvc","arch":"arm64","ext":".exe"},
+            {"name":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","ext":""},
+            {"name":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","ext":""},
+            {"name":"linux-x86_64","os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","ext":""},
+            {"name":"linux-aarch64","os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","cross":true,"ext":""},
+            {"name":"linux-armv7","os":"ubuntu-latest","target":"armv7-unknown-linux-gnueabihf","cross":true,"ext":""},
+            {"name":"linux-riscv64","os":"ubuntu-latest","target":"riscv64gc-unknown-linux-gnu","cross":true,"ext":""},
+            {"name":"linux-mips","os":"ubuntu-24.04","target":"mips-unknown-linux-gnu","build_std":true,"ext":""}
+          ]
+          JSON
+
+          matrix=$(jq -c --arg s "${SELECTED}" '
+            {include: [ .[] | . as $e
+              | select(($s == "") or ((("," + $s + ",") | contains("," + $e.name + ","))) ) ]}
+          ' matrix.json)
+
+          count=$(jq '.include | length' <<<"$matrix")
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no matrix entry matched '$SELECTED'"
+            exit 1
+          fi
+          echo "selected $count target(s): $(jq -r '[.include[].name] | join(", ")' <<<"$matrix")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.name }}
+    needs: plan
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    # `inputs.targets` only exists for workflow_dispatch; every other event
-    # builds the full matrix.
-    if: >-
-      ${{ github.event_name != 'workflow_dispatch'
-          || inputs.targets == ''
-          || contains(format(',{0},', inputs.targets), format(',{0},', matrix.name)) }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # --- Windows -----------------------------------------------------
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            arch: x64
-            ext: .exe
-          - name: windows-aarch64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-            arch: arm64
-            ext: .exe
-          # --- macOS -------------------------------------------------------
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            ext: ""
-          - name: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            ext: ""
-          # --- Linux -------------------------------------------------------
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            ext: ""
-          - name: linux-aarch64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            ext: ""
-          - name: linux-armv7
-            os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            cross: true
-            ext: ""
-          - name: linux-riscv64
-            os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-            cross: true
-            ext: ""
-          # `mips-unknown-linux-gnu` is a Tier 3 target: there is no prebuilt
-          # std, so this one builds core/std from source on nightly. It also
-          # needs the Debian/Ubuntu mips cross toolchain, which was dropped from
-          # the rolling `ubuntu-latest` (26.04) — hence the pinned 24.04 image.
-          - name: linux-mips
-            os: ubuntu-24.04
-            target: mips-unknown-linux-gnu
-            build_std: true
-            ext: ""
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -177,7 +166,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          # The nightly build-std target writes to a different layout.
           cache-on-failure: true
 
       - name: Install cross
