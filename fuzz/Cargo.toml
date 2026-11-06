@@ -1,0 +1,49 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mysql-honeypot-rs = { path = ".." }
+# `io-util` for the in-memory duplex stream and `AsyncWriteExt`, `rt` for the
+# single threaded runtime and `spawn`/`abort`. No `net`, no `time`: nothing in
+# these harnesses may register with an I/O or timer driver.
+tokio = { version = "1", features = ["io-util", "rt"] }
+
+# An empty workspace table is what keeps this crate out of the parent
+# workspace: without it, `cargo build` / `cargo test` / `cargo clippy
+# --all-targets` at the repository root would try to link libFuzzer's `main`.
+[workspace]
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false

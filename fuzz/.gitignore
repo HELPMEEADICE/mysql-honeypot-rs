@@ -1,0 +1,5 @@
+# cargo-fuzz working directories: seeds, crashes, coverage, build output.
+/target
+/corpus
+/artifacts
+/coverage
