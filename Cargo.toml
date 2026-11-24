@@ -33,3 +33,9 @@ strip = "debuginfo"
 debug = false
 incremental = false
 overflow-checks = false
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
